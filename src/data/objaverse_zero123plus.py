@@ -74,11 +74,11 @@ class ObjaverseData(Dataset):
             paths.extend(lvis_dict[k])
         self.paths = paths
             
-        total_objects = len(self.paths)
-        if validation:
-            self.paths = self.paths[-16:] # used last 16 as validation
-        else:
-            self.paths = self.paths[:-16]
+        # total_objects = len(self.paths)
+        # if validation:
+        #     self.paths = self.paths[-16:] # used last 16 as validation
+        # else:
+        #     self.paths = self.paths[:-16]
         print('============= length of dataset %d =============' % len(self.paths))
 
     def __len__(self):

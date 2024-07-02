@@ -8,11 +8,13 @@ from tqdm import tqdm
 from torchvision.transforms import v2
 from torchvision.utils import make_grid, save_image
 from einops import rearrange
+from pathlib import Path
 
 from src.utils.train_util import instantiate_from_config
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel
 from .pipeline import RefOnlyNoisedUNet
 
+from .render_models.textured_mesh import TexturedMeshModel
 
 def scale_latents(latents):
     latents = (latents - 0.22) * 0.75
@@ -67,6 +69,8 @@ class MVDiffusion(pl.LightningModule):
 
         self.unet = pipeline.unet
 
+        self.mesh_model = self.init_mesh_model()
+
         # validation output buffer
         self.validation_step_outputs = []
 
@@ -92,10 +96,39 @@ class MVDiffusion(pl.LightningModule):
         
         self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod).float())
         self.register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1).float())
+
+    def init_mesh_model(self) -> nn.Module:
+        fovyangle = np.pi / 3
+        cache_path = Path('cache') / Path('shapes/spot_triangulated.obj').stem
+        cache_path.mkdir(parents=True, exist_ok=True)
+        model = TexturedMeshModel(
+            # JA: GuideConfig values START
+            dy=0.25,
+            shape_scale=0.6,
+            initial_texture=None,
+            texture_interpolation_mode='bilinear',
+            reference_texture=None,
+            shape_path='shapes/spot_triangulated.obj',
+            # JA: GuideConfig values END
+
+            device=self.device,
+            render_grid_size=1200,
+            cache_path=cache_path,
+            texture_resolution=1024,
+            augmentations=False,
+            fovyangle=fovyangle
+        )
+
+        model = model.to(self.device)
+
+        return model
     
     def on_fit_start(self):
-        device = torch.device(f'cuda:{self.global_rank}')
+        # device = torch.device(f'cuda:{self.global_rank}')
+        device = torch.device(f'cpu')
         self.pipeline.to(device)
+        torch.distributed.init_process_group("gloo", world_size=self.trainer.world_size, rank=self.global_rank)
+
         if self.global_rank == 0:
             os.makedirs(os.path.join(self.logdir, 'images'), exist_ok=True)
             os.makedirs(os.path.join(self.logdir, 'images_val'), exist_ok=True)
@@ -179,6 +212,7 @@ class MVDiffusion(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         # get input
+        # cond_imgs, target_imgs, meshes = self.prepare_batch_data(batch)
         cond_imgs, target_imgs = self.prepare_batch_data(batch)
 
         # sample random timestep
@@ -202,6 +236,13 @@ class MVDiffusion(pl.LightningModule):
         v_target = self.get_v(latents, noise, t)
 
         loss, loss_dict = self.compute_loss(v_pred, v_target)
+
+        # outputs = self.contexture.mesh_model.render(
+        #     theta=theta,
+        #     phi=math.radians(phi),
+        #     radius=1.5,
+        #     background=background
+        # )
 
         # logging
         self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
