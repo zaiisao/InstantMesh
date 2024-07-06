@@ -414,220 +414,42 @@ class TexturedMeshModel(nn.Module):
             fp.write(f'Ns 0.000000 \n')
             fp.write(f'map_Kd {name}albedo.png \n')
 
-    def render(self, theta=None, phi=None, radius=None, background=None,
-               use_meta_texture=False, render_cache=None, use_median=False, dims=None, use_batch_render=True):
-        if use_batch_render:
-            if theta is not None:
-                if isinstance(theta, float) or isinstance(theta, int):
-                    theta = torch.tensor([theta]).to(self.device) # JA: [B,]
-                elif isinstance(theta, list):
-                    theta = torch.tensor(theta).to(self.device) # JA: [B,]
+    def render(self, theta=None, phi=None, radius=None, dims=None):
+        if theta is not None:
+            if isinstance(theta, float) or isinstance(theta, int):
+                theta = torch.tensor([theta]).to(self.device) # JA: [B,]
+            elif isinstance(theta, list):
+                theta = torch.tensor(theta).to(self.device) # JA: [B,]
 
-            if phi is not None:
-                if isinstance(phi, float) or isinstance(phi, int):
-                    phi = torch.tensor([phi]).to(self.device)
-                elif isinstance(phi, list):
-                    phi = torch.tensor(phi).to(self.device)
+        if phi is not None:
+            if isinstance(phi, float) or isinstance(phi, int):
+                phi = torch.tensor([phi]).to(self.device)
+            elif isinstance(phi, list):
+                phi = torch.tensor(phi).to(self.device)
 
-            if radius is not None:
-                if isinstance(radius, float) or isinstance(radius, int):
-                    radius = torch.tensor([radius]).to(self.device)
-                elif isinstance(radius, list):
-                    radius = torch.tensor(radius).to(self.device)
+        if radius is not None:
+            if isinstance(radius, float) or isinstance(radius, int):
+                radius = torch.tensor([radius]).to(self.device)
+            elif isinstance(radius, list):
+                radius = torch.tensor(radius).to(self.device)
 
-            return self.render_batch(theta, phi, radius, background,
-                use_meta_texture, render_cache, use_median, dims)
-        else:
-            return self.render_legacy(theta, phi, radius, background,
-                use_meta_texture, render_cache, use_median, dims)
-        
-    def render_legacy(self, theta=None, phi=None, radius=None, background=None,
-               use_meta_texture=False, render_cache=None, use_median=False, dims=None):
-        if render_cache is None:
-            assert theta is not None and phi is not None and radius is not None
-        background_sphere_colors = self.background_sphere_colors[
-            torch.randint(0, self.background_sphere_colors.shape[0], (1,))]
-        if use_meta_texture: # JA: During training of the network, we either learn meta texture or texture
-            texture_img = self.meta_texture_img
-        else:
-            texture_img = self.texture_img  # JA: texture_img is the render image which is actually the
-                                            # learnable texture atlas
+        return self.render_batch(theta, phi, radius, dims)
 
-        if self.augmentations:
-            augmented_vertices = self.augment_vertices()
-        else:
-            augmented_vertices = self.mesh.vertices
+    def render_batch(self, theta=None, phi=None, radius=None,
+               dims=None):
+        batch_size = theta.shape[0]
+        assert theta is not None and phi is not None and radius is not None
 
-        if use_median:
-            diff = (texture_img - torch.tensor(self.default_color).view(1, 3, 1, 1).to(
-                self.device)).abs().sum(axis=1)
-            default_mask = (diff < 0.1).float().unsqueeze(0)
-            median_color = texture_img[0, :].reshape(3, -1)[:, default_mask.flatten() == 0].mean(
-                axis=1)
-            texture_img = texture_img.clone()
-            with torch.no_grad():
-                texture_img.reshape(3, -1)[:, default_mask.flatten() == 1] = median_color.reshape(-1, 1)
-        background_type = 'none'
-        use_render_back = False
-        if background is not None and type(background) == str: # JA: If background is a string, set it as the type
-            background_type = background
-            use_render_back = True
-        pred_features, mask, depth, normals, render_cache = self.renderer.render_single_view_texture(augmented_vertices,
-                                                                                                     self.mesh.faces,
-                                                                                                     self.face_attributes,
-                                                                                                     texture_img,
-                                                                                                     elev=theta,
-                                                                                                     azim=phi,
-                                                                                                     radius=radius,
-                                                                                                     look_at_height=self.dy,
-                                                                                                     render_cache=render_cache,
-                                                                                                     dims=dims,
-                                                                                                     background_type=background_type)
+        augmented_vertices = self.mesh.vertices
 
-        mask = mask.detach()
-
-        if use_render_back:
-            pred_map = pred_features
-            pred_back = pred_features
-        else:
-            if background is None:
-                # JA: background_sphere_colors is used when the background is None
-                pred_back, _, _ = self.renderer.render_single_view(self.env_sphere,
-                                                                   background_sphere_colors,
-                                                                   elev=theta,
-                                                                   azim=phi,
-                                                                   radius=radius,
-                                                                   dims=dims,
-                                                                   look_at_height=self.dy, calc_depth=False)
-            elif len(background.shape) == 1:
-                pred_back = torch.ones_like(pred_features) * background.reshape(1, 3, 1, 1)
-            else:
-                pred_back = background
-
-            pred_map = pred_back * (1 - mask) + pred_features * mask
-
-        if not use_meta_texture:
-            pred_map = pred_map.clamp(0, 1)
-            pred_features = pred_features.clamp(0, 1)
-
-        return {'image': pred_map, 'mask': mask, 'background': pred_back,
-                'foreground': pred_features, 'depth': depth, 'normals': normals, 'render_cache': render_cache,
-                'texture_map': texture_img}
-    
-    def render_batch(self, theta=None, phi=None, radius=None, background=None,
-               use_meta_texture=False, render_cache=None, use_median=False, dims=None):
-        if render_cache is None:
-            batch_size = theta.shape[0]
-            assert theta is not None and phi is not None and radius is not None
-        else:
-            batch_size = render_cache["uv_features"].shape[0]
-        background_sphere_colors = self.background_sphere_colors[
-            torch.randint(0, self.background_sphere_colors.shape[0], (batch_size,))]
-        texture_img = self.meta_texture_img if use_meta_texture else self.texture_img
-
-        if self.augmentations:
-            augmented_vertices = self.augment_vertices()
-        else:
-            augmented_vertices = self.mesh.vertices
-
-        if use_median: #MJ: check if the texture_img being learned is not so different from the default magenta color
-            diff = (texture_img - torch.tensor(self.default_color).view(1, 3, 1, 1).to(
-                self.device)).abs().sum(axis=1)
-            default_mask = (diff < 0.1).float().unsqueeze(0)
-            median_color = texture_img[0, :].reshape(3, -1)[:, default_mask.flatten() == 0].mean(
-                axis=1)  #MJ: get the median color of the non-magenta region of texture_img
-            texture_img = texture_img.clone()
-            with torch.no_grad(): #MJ: fill the default (magenta) region of texture_img by the median color
-                texture_img.reshape(3, -1)[:, default_mask.flatten() == 1] = median_color.reshape(-1, 1)
-                
-        #MJ:  When rendering images, having large patches of a default or placeholder color (like magenta) 
-        #  can be visually jarring and unrealistic. By filling these regions with a median color derived
-        #  from the actual textured parts of the image, the overall appearance becomes more cohesive 
-        #  and aesthetically pleasing. This helps in creating a more seamless and realistic image,
-        #  especially in contexts  where the texture details are crucial, such as in photorealistic rendering.  
-        
-        #==>
-        # Coverage Gaps: Despite the intention to cover the entire texture map with data from various 
-        # viewpoints, gaps can occur. This might be due to occlusions, insufficient viewpoint coverage,
-        # or limitations in the image processing pipeline (e.g., alignment errors or inadequate resolution). 
-        # In such cases,  some regions of the texture map may not receive any data, resulting in default color patches.     
-        background_type = 'none'
-        use_render_back = False
-        if background is not None and type(background) == str: # JA: If background is a string, set it as the type
-            background_type = background
-            use_render_back = True
-        
-        # JA: We need to repeat several tensors to support the batch size.
-        # For example, with a tensor of the shape, [1, 3, 1200, 1200], doing
-        # repeat(batch_size, 1, 1, 1) results in [1 * batch_size, 3 * 1, 1200 * 1, 1200 * 1]
-        pred_features, mask, depth, normals, render_cache = self.renderer.render_multiple_view_texture(
+        _,_, depth, _,_ = self.renderer.render_multiple_view_texture(
             augmented_vertices[None].repeat(batch_size, 1, 1),
             self.mesh.faces, # JA: the faces tensor can be shared across the batch and does not require its own batch dimension.
-            self.face_attributes.repeat(batch_size, 1, 1, 1),
-           #MJ :texture_img.repeat(batch_size, 1, 1, 1),
-            texture_img.expand(batch_size, -1, -1, -1), #MJ: Note the use of -1 in .expand(), which tells PyTorch to keep the size of those dimensions as is (3, 1024, and 1024, respectively).
             elev=theta,
             azim=phi,
             radius=radius,
             look_at_height=self.dy,
-            render_cache=render_cache,
-            dims=dims,
-            background_type=background_type
+            dims=dims
         )
-        
-        #   texture_img.repeat(batch_size, 1, 1, 1),: When you use the repeat method in PyTorch, such as texture_img.repeat(batch_size, 1, 1, 1), 
-        # it does indeed create separate copies of texture_img in the resulting tensor, but these copies are
-        # not independent in terms of gradient computation.
-        # Gradients: Although repeat creates what seems like separate copies of the data for forward computation,
-        # all these copies still reference back to the original texture_img tensor when it comes to computing gradients.
-        # If a gradient is computed with respect to the repeated tensor during backpropagation, 
-        # it will aggregate (sum) the gradients from all copies back into the original texture_img.
-        # This means that the gradient of each parameter in texture_img will be the sum of the gradients
-        # computed across all batch instances where it was used.
-        
-        # Using .expand() is particularly useful in models where a parameter tensor (like weights, biases,
-        # or a specific feature map) needs to be applied identically across multiple instances 
-        # or positions without creating multiple independent copies, thus saving memory and computational resources.
-        
 
-        mask = mask.detach()
-
-        if use_render_back:
-            pred_map = pred_features
-            pred_back = pred_features
-        else:
-            if background is None:
-                pred_back, _, _ = self.renderer.render_multiple_view(self.env_sphere,
-                                                                   background_sphere_colors,
-                                                                   elev=theta,
-                                                                   azim=phi,
-                                                                   radius=radius,
-                                                                   dims=dims,
-                                                                   look_at_height=self.dy, calc_depth=False)
-            elif len(background.shape) == 1:
-                pred_back = torch.ones_like(pred_features) * background.reshape(1, 3, 1, 1)
-            else:
-                pred_back = background
-
-            pred_map = pred_back * (1 - mask) + pred_features * mask
-
-        if not use_meta_texture:
-            pred_map = pred_map.clamp(0, 1)
-            pred_features = pred_features.clamp(0, 1)
-
-        return {'image': pred_map, 'mask': mask, 'background': pred_back,
-                'foreground': pred_features, 'depth': depth, 'normals': normals, 'render_cache': render_cache,
-                'texture_map': texture_img}
-
-    def draw(self, theta, phi, radius, target_rgb):
-        # failed attempt to draw on the texture image
-
-        uv_features, face_idx = self.renderer.project_uv_single_view(self.mesh.vertices,
-                                                                     self.mesh.faces,
-                                                                     self.face_attributes,
-                                                                     elev=theta,
-                                                                     azim=phi,
-                                                                     radius=radius,
-                                                                     look_at_height=self.dy)
-        unique_face_idx = torch.unique(face_idx)
-        print('')
+        return {'depth': depth}

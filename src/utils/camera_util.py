@@ -91,13 +91,18 @@ def FOV_to_intrinsics(fov, device='cpu'):
     intrinsics = torch.tensor([[focal_length, 0, 0.5], [0, focal_length, 0.5], [0, 0, 1]], device=device)
     return intrinsics
 
+def get_zero123plus_angles():
+    azimuths = np.array([30, 90, 150, 210, 270, 330]).astype(float)
+    elevations = np.array([20, -10, 20, -10, 20, -10]).astype(float)
+
+    return azimuths, elevations
 
 def get_zero123plus_input_cameras(batch_size=1, radius=4.0, fov=30.0):
     """
     Get the input camera parameters.
     """
-    azimuths = np.array([30, 90, 150, 210, 270, 330]).astype(float)
-    elevations = np.array([20, -10, 20, -10, 20, -10]).astype(float)
+
+    azimuths, elevations = get_zero123plus_angles()
     
     c2ws = spherical_camera_pose(azimuths, elevations, radius)
     c2ws = c2ws.float().flatten(-2)

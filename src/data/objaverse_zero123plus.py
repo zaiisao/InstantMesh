@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 from pathlib import Path
+import kaolin
 
 from src.utils.train_util import instantiate_from_config
 
@@ -103,10 +104,13 @@ class ObjaverseData(Dataset):
             bkg_color = [1., 1., 1.]
 
             img_list = []
+            depth_list = []
             try:
                 for idx in range(7):
                     img, alpha = self.load_im(os.path.join(image_path, '%03d.png' % idx), bkg_color)
+                    depth, alpha = self.load_im(os.path.join(image_path, '%03d_depth.png' % idx), bkg_color)
                     img_list.append(img)
+                    depth_list.append(depth)
 
             except Exception as e:
                 print(e)
@@ -116,9 +120,19 @@ class ObjaverseData(Dataset):
             break
         
         imgs = torch.stack(img_list, dim=0).float()
+        depths = torch.stack(depth_list, dim=0).float()
+        
+        mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
+        mesh = kaolin.io.gltf.import_mesh(mesh_path)
+
+        mesh_vertices = mesh.vertices
+        mesh_faces = mesh.faces
 
         data = {
             'cond_imgs': imgs[0],           # (3, H, W)
             'target_imgs': imgs[1:],        # (6, 3, H, W)
+            'target_depth_imgs': depths[1:],
+            'mesh_vertices': mesh_vertices,
+            'mesh_faces': mesh_faces
         }
         return data

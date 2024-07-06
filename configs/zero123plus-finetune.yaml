@@ -8,11 +8,13 @@ model:
       pretrained_model_name_or_path: sudo-ai/zero123plus-v1.2
       custom_pipeline: ./zero123plus
 
+    use_depth_controlnet: true
+
 data:
   target: src.data.objaverse_zero123plus.DataModuleFromConfig
   params:
-    batch_size: 6
-    num_workers: 8
+    batch_size: 1
+    num_workers: 0
     train:
       target: src.data.objaverse_zero123plus.ObjaverseData
       params:

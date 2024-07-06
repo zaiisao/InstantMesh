@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import math
+import kaolin
 from tqdm import tqdm
 from torchvision.transforms import v2
 from torchvision.utils import make_grid, save_image
@@ -11,8 +13,12 @@ from einops import rearrange
 from pathlib import Path
 
 from src.utils.train_util import instantiate_from_config
-from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel
+from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel, ControlNetModel
 from .pipeline import RefOnlyNoisedUNet
+
+from src.utils.camera_util import (
+    get_zero123plus_angles
+)
 
 from .render_models.textured_mesh import TexturedMeshModel
 
@@ -47,6 +53,7 @@ class MVDiffusion(pl.LightningModule):
         self,
         stable_diffusion_config,
         drop_cond_prob=0.1,
+        use_depth_controlnet=False,
     ):
         super(MVDiffusion, self).__init__()
 
@@ -59,6 +66,12 @@ class MVDiffusion(pl.LightningModule):
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
             pipeline.scheduler.config, timestep_spacing='trailing'
         )
+
+        if use_depth_controlnet:
+            pipeline.add_controlnet(ControlNetModel.from_pretrained(
+                "sudo-ai/controlnet-zp11-depth-v1"
+            ), conditioning_scale=0.75)
+
         self.pipeline = pipeline
 
         train_sched = DDPMScheduler.from_config(self.pipeline.scheduler.config)
@@ -69,7 +82,7 @@ class MVDiffusion(pl.LightningModule):
 
         self.unet = pipeline.unet
 
-        self.mesh_model = self.init_mesh_model()
+        # self.mesh_model = None #self.init_mesh_model()
 
         # validation output buffer
         self.validation_step_outputs = []
@@ -97,37 +110,35 @@ class MVDiffusion(pl.LightningModule):
         self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod).float())
         self.register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1).float())
 
-    def init_mesh_model(self) -> nn.Module:
-        fovyangle = np.pi / 3
-        cache_path = Path('cache') / Path('shapes/spot_triangulated.obj').stem
-        cache_path.mkdir(parents=True, exist_ok=True)
-        model = TexturedMeshModel(
-            # JA: GuideConfig values START
-            dy=0.25,
-            shape_scale=0.6,
-            initial_texture=None,
-            texture_interpolation_mode='bilinear',
-            reference_texture=None,
-            shape_path='shapes/spot_triangulated.obj',
-            # JA: GuideConfig values END
+    # def init_mesh_model(self, shape_path) -> nn.Module:
+    #     fovyangle = np.pi / 3
+    #     cache_path = Path('cache') / Path('shapes/spot_triangulated.obj').stem
+    #     cache_path.mkdir(parents=True, exist_ok=True)
+    #     model = TexturedMeshModel(
+    #         # JA: GuideConfig values START
+    #         dy=0.25,
+    #         shape_scale=0.6,
+    #         initial_texture=None,
+    #         texture_interpolation_mode='bilinear',
+    #         reference_texture=None,
+    #         shape_path='shapes/spot_triangulated.obj',
+    #         # JA: GuideConfig values END
 
-            device=self.device,
-            render_grid_size=1200,
-            cache_path=cache_path,
-            texture_resolution=1024,
-            augmentations=False,
-            fovyangle=fovyangle
-        )
+    #         device=torch.device(f'cuda'),
+    #         render_grid_size=1200,
+    #         cache_path=cache_path,
+    #         texture_resolution=1024,
+    #         augmentations=False,
+    #         fovyangle=fovyangle
+    #     )
 
-        model = model.to(self.device)
+    #     model = model.to(self.device)
 
-        return model
+    #     return model
     
     def on_fit_start(self):
-        # device = torch.device(f'cuda:{self.global_rank}')
-        device = torch.device(f'cpu')
+        device = torch.device(f'cuda:{self.global_rank}')
         self.pipeline.to(device)
-        torch.distributed.init_process_group("gloo", world_size=self.trainer.world_size, rank=self.global_rank)
 
         if self.global_rank == 0:
             os.makedirs(os.path.join(self.logdir, 'images'), exist_ok=True)
@@ -147,7 +158,15 @@ class MVDiffusion(pl.LightningModule):
         target_imgs = rearrange(target_imgs, 'b (x y) c h w -> b c (x h) (y w)', x=3, y=2)    # (B, C, 3H, 2W)
         target_imgs = target_imgs.to(self.device)
 
-        return cond_imgs, target_imgs
+        target_depth_imgs = batch['target_depth_imgs']  # (B, 6, C, H, W)
+        target_depth_imgs = v2.functional.resize(target_depth_imgs, 320, interpolation=3, antialias=True).clamp(0, 1)
+        target_depth_imgs = rearrange(target_depth_imgs, 'b (x y) c h w -> b c (x h) (y w)', x=3, y=2)    # (B, C, 3H, 2W)
+        target_depth_imgs = target_depth_imgs.to(self.device)
+
+        mesh_vertices = batch['mesh_vertices'][:, None].repeat(1, batch['target_depth_imgs'].shape[1], 1, 1)
+        mesh_faces = batch['mesh_faces']
+
+        return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces
     
     @torch.no_grad()
     def forward_vision_encoder(self, images):
@@ -183,12 +202,13 @@ class MVDiffusion(pl.LightningModule):
         latents = scale_latents(latents)
         return latents
     
-    def forward_unet(self, latents, t, prompt_embeds, cond_latents):
+    def forward_unet(self, latents, t, prompt_embeds, cond_latents, control_depth):
         dtype = next(self.pipeline.unet.parameters()).dtype
         latents = latents.to(dtype)
         prompt_embeds = prompt_embeds.to(dtype)
         cond_latents = cond_latents.to(dtype)
-        cross_attention_kwargs = dict(cond_lat=cond_latents)
+        control_depth = control_depth.to(dtype)
+        cross_attention_kwargs = dict(cond_lat=cond_latents, control_depth=control_depth)
         pred_noise = self.pipeline.unet(
             latents,
             t,
@@ -213,7 +233,7 @@ class MVDiffusion(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # get input
         # cond_imgs, target_imgs, meshes = self.prepare_batch_data(batch)
-        cond_imgs, target_imgs = self.prepare_batch_data(batch)
+        cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces = self.prepare_batch_data(batch)
 
         # sample random timestep
         B = cond_imgs.shape[0]
@@ -232,17 +252,81 @@ class MVDiffusion(pl.LightningModule):
         noise = torch.randn_like(latents)
         latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
         
-        v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents)
+        v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
         v_target = self.get_v(latents, noise, t)
 
         loss, loss_dict = self.compute_loss(v_pred, v_target)
 
-        # outputs = self.contexture.mesh_model.render(
-        #     theta=theta,
-        #     phi=math.radians(phi),
-        #     radius=1.5,
-        #     background=background
-        # )
+        # azimuths = [0, 30, 90, 150, 210, 270, 330]
+        # elevations = [0, 20, -10, 20, -10, 20, -10]
+        azimuths, elevations = get_zero123plus_angles()
+        azimuths = torch.from_numpy(azimuths).to(self.device, torch.float32)
+        elevations = torch.from_numpy(elevations).to(self.device, torch.float32)
+
+        def get_camera_from_multiple_view(elev, azim, r, look_at_height=0.0):
+            x = r * torch.sin(elev) * torch.sin(azim)
+            y = r * torch.cos(elev)
+            z = r * torch.sin(elev) * torch.cos(azim)
+
+            pos = torch.stack([x, y, z], dim=1)
+            look_at = torch.zeros_like(pos)
+            look_at[:, 1] = look_at_height
+            camera_up_direction = torch.ones_like(pos) * torch.tensor([0.0, 1.0, 0.0]).to(pos.device)
+
+            camera_proj = kaolin.render.camera.generate_transformation_matrix(pos, look_at, camera_up_direction)
+            return camera_proj
+        
+        def normalize_multiple_depth(depth_maps):
+            # assert (depth_maps.amax(dim=(1, 2)) <= 0).all(), 'depth map should be negative'
+            assert not (depth_maps == 0).all(), 'depth map should not be empty'
+            object_mask = depth_maps != 0  # Mask for non-background pixels
+
+            # To handle operations for masked regions, we need to use masked operations
+            # Set default min and max values to avoid affecting the normalization
+            masked_depth_maps = torch.where(object_mask, depth_maps, torch.tensor(float('inf')).to(depth_maps.device))
+            min_depth = masked_depth_maps.amin(dim=(1, 2), keepdim=True)
+
+            masked_depth_maps = torch.where(object_mask, depth_maps, torch.tensor(-float('inf')).to(depth_maps.device))
+            max_depth = masked_depth_maps.amax(dim=(1, 2), keepdim=True)
+
+            range_depth = max_depth - min_depth
+
+            # Calculate normalized depth maps
+            min_val = 0.5
+            normalized_depth_maps = torch.where(
+                object_mask,
+                ((1 - min_val) * (depth_maps - min_depth) / range_depth) + min_val,
+                depth_maps # JA: Where the object mask is 0, depth map is 0 and we will return it
+            )
+
+            return normalized_depth_maps
+
+        camera_transform = get_camera_from_multiple_view(
+            elevations, azimuths, r=1.5,
+            look_at_height=0
+        )
+
+        camera_projection = kaolin.render.camera.generate_perspective_projection(np.pi / 3).to(self.device)
+
+        face_vertices_camera_list, face_vertices_image_list = [], []
+        for batch in range(B):
+            face_vertices_camera_one_mesh, face_vertices_image_one_mesh, _ = kaolin.render.mesh.prepare_vertices(
+                mesh_vertices[batch], mesh_faces[batch],
+                camera_projection,
+                camera_transform=camera_transform
+            )
+
+            face_vertices_camera_list.append(face_vertices_camera_one_mesh)
+            face_vertices_image_list.append(face_vertices_image_one_mesh)
+
+        face_vertices_camera = torch.cat(face_vertices_camera_list, dim=0)
+        face_vertices_image = torch.cat(face_vertices_image_list, dim=0)
+
+        # JA: face_vertices_camera[:, :, :, -1] likely refers to the z-component (depth component) of these coordinates, used both for depth mapping and for determining how textures map onto the surfaces during UV feature generation.
+        depth_map_unnormalized_bhwc, _ = kaolin.render.mesh.rasterize(320, 320, face_vertices_camera[:, :, :, -1],
+                                                            face_vertices_image, face_vertices_camera[:, :, :, -1:]) 
+        depth_map_unnormalized = depth_map_unnormalized_bhwc.permute(0, 3, 1, 2)
+        depth_map = normalize_multiple_depth(depth_map_unnormalized)
 
         # logging
         self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
