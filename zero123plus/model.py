@@ -232,7 +232,7 @@ class MVDiffusion(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         # get input
-        # cond_imgs, target_imgs, meshes = self.prepare_batch_data(batch)
+        # cond_imgs, target_imgs = self.prepare_batch_data(batch)
         cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces = self.prepare_batch_data(batch)
 
         # sample random timestep
@@ -263,19 +263,22 @@ class MVDiffusion(pl.LightningModule):
         azimuths = torch.from_numpy(azimuths).to(self.device, torch.float32)
         elevations = torch.from_numpy(elevations).to(self.device, torch.float32)
 
-        def get_camera_from_multiple_view(elev, azim, r, look_at_height=0.0):
+        def get_camera_from_multiple_view(elev, azim, r):
+            # Adjust azimuth angle to account for coordinate system differences
+            azim = azim + torch.pi
+
+            # Calculate camera position using Blender's logic adjusted for Kaolin
             x = r * torch.sin(elev) * torch.sin(azim)
             y = r * torch.cos(elev)
             z = r * torch.sin(elev) * torch.cos(azim)
 
             pos = torch.stack([x, y, z], dim=1)
             look_at = torch.zeros_like(pos)
-            look_at[:, 1] = look_at_height
             camera_up_direction = torch.ones_like(pos) * torch.tensor([0.0, 1.0, 0.0]).to(pos.device)
 
             camera_proj = kaolin.render.camera.generate_transformation_matrix(pos, look_at, camera_up_direction)
             return camera_proj
-        
+
         def normalize_multiple_depth(depth_maps):
             # assert (depth_maps.amax(dim=(1, 2)) <= 0).all(), 'depth map should be negative'
             assert not (depth_maps == 0).all(), 'depth map should not be empty'
@@ -302,16 +305,20 @@ class MVDiffusion(pl.LightningModule):
             return normalized_depth_maps
 
         camera_transform = get_camera_from_multiple_view(
-            elevations, azimuths, r=1.5,
-            look_at_height=0
+            torch.deg2rad(90 - elevations), torch.deg2rad(90 + azimuths),
+            r=1.5
         )
 
-        camera_projection = kaolin.render.camera.generate_perspective_projection(np.pi / 3).to(self.device)
+        sensor_width = 32
+        focal_length = 35
+        fovyangle = 2 * math.atan(sensor_width / (2 * focal_length))
+
+        camera_projection = kaolin.render.camera.generate_perspective_projection(fovyangle).to(self.device)
 
         face_vertices_camera_list, face_vertices_image_list = [], []
-        for batch in range(B):
+        for batch_num in range(B):
             face_vertices_camera_one_mesh, face_vertices_image_one_mesh, _ = kaolin.render.mesh.prepare_vertices(
-                mesh_vertices[batch], mesh_faces[batch],
+                mesh_vertices[batch_num], mesh_faces[batch_num],
                 camera_projection,
                 camera_transform=camera_transform
             )
@@ -323,7 +330,7 @@ class MVDiffusion(pl.LightningModule):
         face_vertices_image = torch.cat(face_vertices_image_list, dim=0)
 
         # JA: face_vertices_camera[:, :, :, -1] likely refers to the z-component (depth component) of these coordinates, used both for depth mapping and for determining how textures map onto the surfaces during UV feature generation.
-        depth_map_unnormalized_bhwc, _ = kaolin.render.mesh.rasterize(320, 320, face_vertices_camera[:, :, :, -1],
+        depth_map_unnormalized_bhwc, _ = kaolin.render.mesh.rasterize(512, 512, face_vertices_camera[:, :, :, -1],
                                                             face_vertices_image, face_vertices_camera[:, :, :, -1:]) 
         depth_map_unnormalized = depth_map_unnormalized_bhwc.permute(0, 3, 1, 2)
         depth_map = normalize_multiple_depth(depth_map_unnormalized)

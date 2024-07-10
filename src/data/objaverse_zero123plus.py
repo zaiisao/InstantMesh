@@ -96,6 +96,37 @@ class ObjaverseData(Dataset):
         alpha = torch.from_numpy(alpha).permute(2, 0, 1).contiguous().float()
         return image, alpha
     
+    def load_mesh(self, mesh_path):
+        mesh = kaolin.io.gltf.import_mesh(mesh_path)
+
+        def normalize_mesh(vertices):
+            # Compute bounding box
+            bbox_min = torch.min(vertices, dim=0).values
+            bbox_max = torch.max(vertices, dim=0).values
+            
+            # Compute scale factor to fit within unit cube
+            scale = 1.0 / torch.max(bbox_max - bbox_min)
+            
+            # Scale vertices
+            vertices = vertices * scale
+            
+            # Recompute bounding box after scaling
+            bbox_min = torch.min(vertices, dim=0).values
+            bbox_max = torch.max(vertices, dim=0).values
+            
+            # Compute translation to center mesh at origin
+            offset = -(bbox_min + bbox_max) / 2.0
+            
+            # Translate vertices
+            vertices = vertices + offset
+            
+            return vertices
+        
+        mesh_vertices = normalize_mesh(mesh.vertices)
+        mesh_faces = mesh.faces
+
+        return mesh_vertices, mesh_faces
+
     def __getitem__(self, index):
         while True:
             image_path = os.path.join(self.root_dir, self.image_dir, self.paths[index])
@@ -123,10 +154,7 @@ class ObjaverseData(Dataset):
         depths = torch.stack(depth_list, dim=0).float()
         
         mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
-        mesh = kaolin.io.gltf.import_mesh(mesh_path)
-
-        mesh_vertices = mesh.vertices
-        mesh_faces = mesh.faces
+        mesh_vertices, mesh_faces = self.load_mesh(mesh_path)
 
         data = {
             'cond_imgs': imgs[0],           # (3, H, W)
