@@ -12,6 +12,8 @@ from pytorch_lightning.utilities import rank_zero_only, rank_zero_warn
 
 from src.utils.train_util import instantiate_from_config
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ["TORCH_USE_CUDA_DSA"] = '1'
 
 @rank_zero_only
 def rank_zero_print(*args):

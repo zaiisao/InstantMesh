@@ -108,24 +108,29 @@ class ObjaverseData(Dataset):
             scale = 1.0 / torch.max(bbox_max - bbox_min)
             
             # Scale vertices
-            vertices = vertices * scale
+            scaled_vertices = vertices * scale
             
             # Recompute bounding box after scaling
-            bbox_min = torch.min(vertices, dim=0).values
-            bbox_max = torch.max(vertices, dim=0).values
-            
+            bbox_min = torch.min(scaled_vertices, dim=0).values
+            bbox_max = torch.max(scaled_vertices, dim=0).values
+
             # Compute translation to center mesh at origin
-            offset = -(bbox_min + bbox_max) / 2.0
-            
+            bbox_center = (bbox_min + bbox_max) / 2.0
+
             # Translate vertices
-            vertices = vertices + offset
-            
-            return vertices
+            vertices_from_bbox_center = scaled_vertices - bbox_center
+
+            # JA: scaled_vertices on the right-hand side refers to the coordiantes of the vertices from
+            # the world coordinate system
+
+            return vertices_from_bbox_center
         
         mesh_vertices = normalize_mesh(mesh.vertices)
         mesh_faces = mesh.faces
+        mesh_uvs = mesh.uvs
+        mesh_face_uvs_idx = mesh.face_uvs_idx
 
-        return mesh_vertices, mesh_faces
+        return mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
 
     def __getitem__(self, index):
         while True:
@@ -154,13 +159,16 @@ class ObjaverseData(Dataset):
         depths = torch.stack(depth_list, dim=0).float()
         
         mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
-        mesh_vertices, mesh_faces = self.load_mesh(mesh_path)
+        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(mesh_path)
 
         data = {
             'cond_imgs': imgs[0],           # (3, H, W)
             'target_imgs': imgs[1:],        # (6, 3, H, W)
             'target_depth_imgs': depths[1:],
             'mesh_vertices': mesh_vertices,
-            'mesh_faces': mesh_faces
+            'mesh_faces': mesh_faces,
+            'mesh_uvs': mesh_uvs,
+            'mesh_face_uvs_idx': mesh_face_uvs_idx
         }
+
         return data
