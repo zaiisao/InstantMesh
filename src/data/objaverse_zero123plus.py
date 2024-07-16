@@ -9,9 +9,47 @@ from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 from pathlib import Path
 import kaolin
+from typing import List, Tuple
 
 from src.utils.train_util import instantiate_from_config
 
+def pad_tensors(tensor_list, pad_value=-1):
+    max_len = max(tensor.shape[0] for tensor in tensor_list)
+    padded_tensors = []
+
+    for tensor in tensor_list:
+        pad_size = max_len - tensor.shape[0]
+
+        # Create a padding tensor with the same type and device as the original tensor
+        pad_tensor = torch.full((pad_size, *tensor.shape[1:]), pad_value, dtype=tensor.dtype, device=tensor.device)
+
+        # Concatenate the original tensor with the padding tensor
+        padded_tensor = torch.cat([tensor, pad_tensor], dim=0)
+
+        padded_tensors.append(padded_tensor)
+
+    return padded_tensors
+
+def collate_fn(data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+    cond_imgs, target_imgs, target_depth_img, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = zip(*data)
+
+    padded_mesh_vertices = pad_tensors(mesh_vertices)
+    padded_mesh_faces = pad_tensors(mesh_faces)
+    padded_mesh_uvs = pad_tensors(mesh_uvs)
+    padded_mesh_face_uvs_idx = pad_tensors(mesh_face_uvs_idx)
+
+    data = {
+        'cond_imgs': torch.stack(cond_imgs),
+        'target_imgs': torch.stack(target_imgs),
+        'target_depth_imgs': torch.stack(target_depth_img),
+
+        'padded_mesh_vertices': torch.stack(padded_mesh_vertices),
+        'padded_mesh_faces': torch.stack(padded_mesh_faces),
+        'padded_mesh_uvs': torch.stack(padded_mesh_uvs),
+        'padded_mesh_face_uvs_idx': torch.stack(padded_mesh_face_uvs_idx)
+    }
+
+    return data
 
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(
@@ -46,16 +84,16 @@ class DataModuleFromConfig(pl.LightningDataModule):
     def train_dataloader(self):
 
         sampler = DistributedSampler(self.datasets['train'])
-        return wds.WebLoader(self.datasets['train'], batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, sampler=sampler)
+        return wds.WebLoader(self.datasets['train'], batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, sampler=sampler, collate_fn=collate_fn)
 
     def val_dataloader(self):
 
         sampler = DistributedSampler(self.datasets['validation'])
-        return wds.WebLoader(self.datasets['validation'], batch_size=4, num_workers=self.num_workers, shuffle=False, sampler=sampler)
+        return wds.WebLoader(self.datasets['validation'], batch_size=4, num_workers=self.num_workers, shuffle=False, sampler=sampler, collate_fn=collate_fn)
 
     def test_dataloader(self):
 
-        return wds.WebLoader(self.datasets['test'], batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        return wds.WebLoader(self.datasets['test'], batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, collate_fn=collate_fn)
 
 
 class ObjaverseData(Dataset):
@@ -161,14 +199,18 @@ class ObjaverseData(Dataset):
         mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
         mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(mesh_path)
 
-        data = {
-            'cond_imgs': imgs[0],           # (3, H, W)
-            'target_imgs': imgs[1:],        # (6, 3, H, W)
-            'target_depth_imgs': depths[1:],
-            'mesh_vertices': mesh_vertices,
-            'mesh_faces': mesh_faces,
-            'mesh_uvs': mesh_uvs,
-            'mesh_face_uvs_idx': mesh_face_uvs_idx
-        }
+        # data = {
+        #     'cond_imgs': imgs[0],           # (3, H, W)
+        #     'target_imgs': imgs[1:],        # (6, 3, H, W)
+        #     'target_depth_imgs': depths[1:],
+        #     'mesh_vertices': mesh_vertices,
+        #     'mesh_faces': mesh_faces,
+        #     'mesh_uvs': mesh_uvs,
+        #     'mesh_face_uvs_idx': mesh_face_uvs_idx
+        # }
 
-        return data
+        cond_imgs = imgs[0]
+        target_imgs = imgs[1:]
+        target_depth_imgs = depths[1:]
+
+        return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx

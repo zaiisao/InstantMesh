@@ -10,19 +10,16 @@ from tqdm import tqdm
 from torchvision.transforms import v2
 from torchvision.utils import make_grid, save_image
 from einops import rearrange
-from pathlib import Path
 
-from src.utils.train_util import instantiate_from_config
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel, ControlNetModel
 from .pipeline import RefOnlyNoisedUNet
+from .renderer import Renderer
 
 from torch_scatter import scatter_max
 
 from src.utils.camera_util import (
     get_zero123plus_angles
 )
-
-from .render_models.textured_mesh import TexturedMeshModel
 
 def scale_latents(latents):
     latents = (latents - 0.22) * 0.75
@@ -112,32 +109,6 @@ class MVDiffusion(pl.LightningModule):
         self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod).float())
         self.register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1).float())
 
-    # def init_mesh_model(self, shape_path) -> nn.Module:
-    #     fovyangle = np.pi / 3
-    #     cache_path = Path('cache') / Path('shapes/spot_triangulated.obj').stem
-    #     cache_path.mkdir(parents=True, exist_ok=True)
-    #     model = TexturedMeshModel(
-    #         # JA: GuideConfig values START
-    #         dy=0.25,
-    #         shape_scale=0.6,
-    #         initial_texture=None,
-    #         texture_interpolation_mode='bilinear',
-    #         reference_texture=None,
-    #         shape_path='shapes/spot_triangulated.obj',
-    #         # JA: GuideConfig values END
-
-    #         device=torch.device(f'cuda'),
-    #         render_grid_size=1200,
-    #         cache_path=cache_path,
-    #         texture_resolution=1024,
-    #         augmentations=False,
-    #         fovyangle=fovyangle
-    #     )
-
-    #     model = model.to(self.device)
-
-    #     return model
-    
     def on_fit_start(self):
         device = torch.device(f'cuda:{self.global_rank}')
         self.pipeline.to(device)
@@ -165,10 +136,29 @@ class MVDiffusion(pl.LightningModule):
         target_depth_imgs = rearrange(target_depth_imgs, 'b (x y) c h w -> b c (x h) (y w)', x=3, y=2)    # (B, C, 3H, 2W)
         target_depth_imgs = target_depth_imgs.to(self.device)
 
-        mesh_vertices = batch['mesh_vertices'][:, None].repeat(1, batch['target_depth_imgs'].shape[1], 1, 1)
-        mesh_faces = batch['mesh_faces']
-        mesh_uvs = batch['mesh_uvs']
-        mesh_face_uvs_idx = batch['mesh_face_uvs_idx']
+        num_viewpoints = target_imgs.shape[1]
+
+        padded_mesh_vertices = batch['padded_mesh_vertices']#[:, None].repeat(1, num_viewpoints, 1, 1)
+        padded_mesh_faces = batch['padded_mesh_faces']
+        padded_mesh_uvs = batch['padded_mesh_uvs']
+        padded_mesh_face_uvs_idx = batch['padded_mesh_face_uvs_idx']
+
+        def unpad_tensors(padded_tensors, pad_value=-1):
+            unpadded_tensors = []
+            
+            for tensor in padded_tensors:
+                # Find the length of valid data by looking for the first occurrence of the pad_value
+                valid_length = (tensor != pad_value).all(dim=1).nonzero(as_tuple=True)[0].max().item() + 1
+                # Slice the tensor up to the valid length
+                unpadded_tensor = tensor[:valid_length]
+                unpadded_tensors.append(unpadded_tensor)
+            
+            return unpadded_tensors
+        
+        mesh_vertices = unpad_tensors(padded_mesh_vertices)
+        mesh_faces = unpad_tensors(padded_mesh_faces)
+        mesh_uvs = unpad_tensors(padded_mesh_uvs)
+        mesh_face_uvs_idx = unpad_tensors(padded_mesh_face_uvs_idx)
 
         return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
     
@@ -234,33 +224,7 @@ class MVDiffusion(pl.LightningModule):
             extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
         )
     
-    def training_step(self, batch, batch_idx):
-        # get input
-        cond_imgs, target_imgs, target_depth_imgs, \
-        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.prepare_batch_data(batch)
-
-        # sample random timestep
-        B = cond_imgs.shape[0]
-        
-        t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
-
-        # classifier-free guidance
-        if np.random.rand() < self.drop_cond_prob:
-            prompt_embeds = self.pipeline._encode_prompt([""]*B, self.device, 1, False)
-            cond_latents = self.encode_condition_image(torch.zeros_like(cond_imgs))
-        else:
-            prompt_embeds = self.forward_vision_encoder(cond_imgs)
-            cond_latents = self.encode_condition_image(cond_imgs)
-
-        latents = self.encode_target_images(target_imgs)
-        noise = torch.randn_like(latents)
-        latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
-        
-        v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
-        v_target = self.get_v(latents, noise, t)
-
-        loss, loss_dict = self.compute_loss(v_pred, v_target)
-
+    def compute_seam_loss(self, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx):
         texture_img = nn.Parameter(torch.ones(1, 3, 512, 512).cuda() * 0.5)
 
         # azimuths = [0, 30, 90, 150, 210, 270, 330]
@@ -269,48 +233,9 @@ class MVDiffusion(pl.LightningModule):
         azimuths = torch.from_numpy(azimuths).to(self.device, torch.float32)
         elevations = torch.from_numpy(elevations).to(self.device, torch.float32)
 
-        def get_camera_from_multiple_view(elev, azim, r):
-            # Adjust azimuth angle to account for coordinate system differences
-            azim = azim + torch.pi
+        mesh_renderer = Renderer(mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
 
-            # Calculate camera position using Blender's logic adjusted for Kaolin
-            x = r * torch.sin(elev) * torch.sin(azim)
-            y = r * torch.cos(elev)
-            z = r * torch.sin(elev) * torch.cos(azim)
-
-            pos = torch.stack([x, y, z], dim=1)
-            look_at = torch.zeros_like(pos)
-            camera_up_direction = torch.ones_like(pos) * torch.tensor([0.0, 1.0, 0.0]).to(pos.device)
-
-            camera_proj = kaolin.render.camera.generate_transformation_matrix(pos, look_at, camera_up_direction)
-            return camera_proj
-
-        def normalize_multiple_depth(depth_maps):
-            # assert (depth_maps.amax(dim=(1, 2)) <= 0).all(), 'depth map should be negative'
-            assert not (depth_maps == 0).all(), 'depth map should not be empty'
-            object_mask = depth_maps != 0  # Mask for non-background pixels
-
-            # To handle operations for masked regions, we need to use masked operations
-            # Set default min and max values to avoid affecting the normalization
-            masked_depth_maps = torch.where(object_mask, depth_maps, torch.tensor(float('inf')).to(depth_maps.device))
-            min_depth = masked_depth_maps.amin(dim=(1, 2), keepdim=True)
-
-            masked_depth_maps = torch.where(object_mask, depth_maps, torch.tensor(-float('inf')).to(depth_maps.device))
-            max_depth = masked_depth_maps.amax(dim=(1, 2), keepdim=True)
-
-            range_depth = max_depth - min_depth
-
-            # Calculate normalized depth maps
-            min_val = 0.5
-            normalized_depth_maps = torch.where(
-                object_mask,
-                ((1 - min_val) * (depth_maps - min_depth) / range_depth) + min_val,
-                depth_maps # JA: Where the object mask is 0, depth map is 0 and we will return it
-            )
-
-            return normalized_depth_maps
-
-        camera_transform = get_camera_from_multiple_view(
+        camera_transform = mesh_renderer.get_camera_from_views(
             torch.deg2rad(90 - elevations),
             torch.deg2rad(90 + azimuths),
             r=1.5
@@ -339,12 +264,6 @@ class MVDiffusion(pl.LightningModule):
         face_vertices_image = torch.cat(face_vertices_image_list, dim=0)
         face_normals = torch.cat(face_normals_list, dim=0)
 
-        # JA: face_vertices_camera[:, :, :, -1] likely refers to the z-component (depth component) of these coordinates, used both for depth mapping and for determining how textures map onto the surfaces during UV feature generation.
-        depth_map_unnormalized_bhwc, _ = kaolin.render.mesh.rasterize(512, 512, face_vertices_camera[:, :, :, -1],
-                                                            face_vertices_image, face_vertices_camera[:, :, :, -1:]) 
-        depth_map_unnormalized = depth_map_unnormalized_bhwc.permute(0, 3, 1, 2)
-        depth_map = normalize_multiple_depth(depth_map_unnormalized)
-
         face_attributes = kaolin.ops.mesh.index_vertices_by_faces(
             mesh_uvs.repeat(6, 1, 1), #MJ: shape = (batch_size}, num_points, knum) =(1,4839,2)
             mesh_face_uvs_idx[0].long()        #MJ: shape = num_faces,face_size)=(7500,3)
@@ -355,135 +274,42 @@ class MVDiffusion(pl.LightningModule):
         uv_features = uv_features.detach() #.permute(0, 3, 1, 2)
 
         mask = (face_idx > -1).float()[..., None]
-        
-        def create_face_view_map(face_idx):
-            num_views, H, W = face_idx.shape
 
-            # Flatten the face_idx tensor to make it easier to work with
-            face_idx_flattened_2d = face_idx.view(num_views, -1)  # Shape becomes (num_views, H*W)
+        face_view_map = mesh_renderer.create_face_view_map(face_idx)
+        weight_masks = mesh_renderer.compare_face_normals_between_views(face_view_map, face_normals, face_idx)
 
-            # Get the indices of all elements
-            # JA: From ChatGPT:
-            # torch.meshgrid is used to create a grid of indices that corresponds to each dimension of the input tensor,
-            # specifically in this context for the view indices and pixel indices. It allows us to pair each view index
-            # with every pixel index, thereby creating a full coordinate system that can be mapped directly to the values
-            # in the tensor face_idx.
-            view_by_pixel_indices, pixel_by_view_indices = torch.meshgrid(
-                torch.arange(num_views, device=face_idx.device),
-                torch.arange(H * W, device=face_idx.device),
-                indexing='ij'
-            )
-
-            # Flatten indices tensors
-            view_by_pixel_indices_flattened = view_by_pixel_indices.flatten()
-            pixel_by_view_indices_flattened = pixel_by_view_indices.flatten()
-
-            faces_idx_view_pixel_flattened = face_idx_flattened_2d.flatten()
-
-            # Convert pixel indices back to 2D indices (i, j)
-            pixel_i_indices = pixel_by_view_indices_flattened // W
-            pixel_j_indices = pixel_by_view_indices_flattened % W
-
-            # JA: The original face view map is made of nested dictionaries, which is very inefficient. Face map information
-            # is implemented as a single tensor which is efficient. Only tensors can be processed in GPU; dictionaries cannot
-            # be processed in GPU.
-            # The combined tensor represents, for each pixel (i, j), its view_idx 
-            combined_tensor_for_face_view_map = torch.stack([
-                faces_idx_view_pixel_flattened,
-                view_by_pixel_indices_flattened,
-                pixel_i_indices,
-                pixel_j_indices
-            ], dim=1)
-
-            # Filter valid faces
-            faces_idx_valid_mask = faces_idx_view_pixel_flattened >= 0
-
-            # JA:
-            # [[face_id_1, view_1, i_1, j_1]
-            #  [face_id_1, view_1, i_2, j_2]
-            #  [face_id_1, view_1, i_3, j_3]
-            #  [face_id_1, view_2, i_4, j_4]
-            #  [face_id_1, view_2, i_5, j_5]
-            #  ...
-            #  [face_id_2, view_1, i_k, j_l]
-            #  [face_id_2, view_1, i_{k + 1}, j_{l + 1}]
-            #  [face_id_2, view_2, i_{k + 2}, j_{l + 2}]]
-            #  ...
-            # The above example shows face_id_1 is projected, under view_1, to three pixels (i_1, j_1), (i_2, j_2), (i_3, j_3)
-            # Shape is Nx4 where N is the number of pixels (no greater than H*W*num_views = 1200*1200*7) that projects the
-            # valid face ID.
-            return combined_tensor_for_face_view_map[faces_idx_valid_mask]
-
-        def compare_face_normals_between_views(face_view_map, face_normals, face_idx):
-            num_views, H, W = face_idx.shape
-            weight_masks = torch.full((num_views, 1, H, W), True, dtype=torch.bool, device=face_idx.device)
-
-            face_ids = face_view_map[:, 0] # JA: face_view_map.shape = (H*W*num_views, 4) = (1200*1200*7, 4) = (10080000, 4)
-            views = face_view_map[:, 1]
-            i_coords = face_view_map[:, 2]
-            j_coords = face_view_map[:, 3]
-            z_normals = face_normals[views, face_ids, 2] # JA: The shape of face_normals is (num_views, 3, num_faces)
-                                                        # For example, face_normals can be (7, 3, 14232)
-                                                        # z_normals is (N,)
-
-            # Scatter z-normals into the tensor, ensuring each index only keeps the max value
-            # JA: z_normals is the source/input tensor, and face_ids is the index tensor to scatter_max function.
-            max_z_normals_over_views, _ = scatter_max(z_normals, face_ids, dim=0) # JA: N is a subset of length H*W*num_views
-            # The shape of max_z_normals_over_N is the (num_faces,). The shape of the scatter_max output is equal to the
-            # shape of the number of distinct indices in the index tensor face_ids.
-
-            # Map the gathered max normals back to the respective face ID indices
-            # JA: max_z_normals_over_views represents the max z normals over views for every face ID.
-            # The shape of face_ids is (N,). Therefore the shape of max_z_normals_over_views_per_face is also (N,).
-            max_z_normals_over_views_per_face = max_z_normals_over_views[face_ids]
-
-            # Calculate the unworthy mask where current z-normals are less than the max per face ID
-            unworthy_pixels_mask = z_normals < max_z_normals_over_views_per_face
-
-            # JA: Update the weight masks. The shapes of face_view_map, whence views, i_coords, and j_coords were extracted
-            # from, all have the shape of (N,), which represents the number of valid pixel entries. Therefore,
-            # weight_masks[views, 0, i_coords, j_coords] will also have the shape of (N,) which allows the values in
-            # weight_masks to be set in an elementwise manner.
-            #
-            # weight_masks[views[0], 0, i_coords[0], j_coords[0]] = ~(unworthy_pixels_mask[0])
-            # The above variable represents whether the pixel (i_coords[0], j_coords[0]) under views[0] is worthy to
-            # contribute to the texture atlas.
-            weight_masks[views, 0, i_coords, j_coords] = ~(unworthy_pixels_mask)
-
-            # weight_masks[views[0], 0, i_coords[0], j_coords[0]] = ~(unworthy_pixels_mask[0])
-            # weight_masks[views[1], 0, i_coords[1], j_coords[1]] = ~(unworthy_pixels_mask[1])
-            # weight_masks[views[2], 0, i_coords[2], j_coords[2]] = ~(unworthy_pixels_mask[2])
-            # weight_masks[views[3], 0, i_coords[3], j_coords[2]] = ~(unworthy_pixels_mask[3])
-
-            return weight_masks
-
-        face_view_map = create_face_view_map(face_idx)
-        weight_masks = compare_face_normals_between_views(face_view_map, face_normals, face_idx)
-
-        def project_back(self, render_cache, background, rgb_output, object_mask):
-            optimizer = torch.optim.Adam(self.mesh_model.get_params(), lr=self.cfg.optim.lr, betas=(0.9, 0.99),
-                                        eps=1e-15)
-            for _ in tqdm(range(200), desc='fitting mesh colors'):
-                optimizer.zero_grad()
-                outputs = self.mesh_model.render(background=background,
-                                                render_cache=render_cache)
-                rgb_render = outputs['image']
-
-                mask = object_mask.flatten()
-                masked_pred = rgb_render.reshape(1, rgb_render.shape[1], -1)[:, :, mask > 0]
-                masked_target = rgb_output.reshape(1, rgb_output.shape[1], -1)[:, :, mask > 0]
-                masked_mask = mask[mask > 0]
-                loss = ((masked_pred - masked_target.detach()).pow(2) * masked_mask).mean()
-                loss.backward()
-                optimizer.step()
-
-            return rgb_render
-
-        # texture_map = texture_img.expand(6, -1, -1, -1)
-        import torchvision
-        texture_map =  torchvision.transforms.v2.functional.to_dtype(torchvision.io.read_image("/home/jahn/test.png").cuda())[None].expand(6, -1, -1, -1)
+        texture_map = texture_img.expand(6, -1, -1, -1)
         image_features = kaolin.render.mesh.texture_mapping(uv_features, texture_map, mode="bilinear")
         image_features = image_features * mask
+    
+    def training_step(self, batch, batch_idx):
+        # get input
+        cond_imgs, target_imgs, target_depth_imgs, \
+        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.prepare_batch_data(batch)
+
+        # sample random timestep
+        B = cond_imgs.shape[0]
+        
+        t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
+
+        # classifier-free guidance
+        if np.random.rand() < self.drop_cond_prob:
+            prompt_embeds = self.pipeline._encode_prompt([""]*B, self.device, 1, False)
+            cond_latents = self.encode_condition_image(torch.zeros_like(cond_imgs))
+        else:
+            prompt_embeds = self.forward_vision_encoder(cond_imgs)
+            cond_latents = self.encode_condition_image(cond_imgs)
+
+        latents = self.encode_target_images(target_imgs)
+        noise = torch.randn_like(latents)
+        latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
+        
+        v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
+        v_target = self.get_v(latents, noise, t)
+
+        loss, loss_dict = self.compute_loss(v_pred, v_target)
+
+        seam_loss = self.compute_seam_loss(mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
 
         # logging
         self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
