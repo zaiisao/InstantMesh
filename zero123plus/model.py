@@ -5,21 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import math
-import kaolin
-from tqdm import tqdm
+import kaolin as kal
 from torchvision.transforms import v2
 from torchvision.utils import make_grid, save_image
 from einops import rearrange
+from tqdm import tqdm
 
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel, ControlNetModel
 from .pipeline import RefOnlyNoisedUNet
-from .renderer import Renderer
-
-from torch_scatter import scatter_max
-
-from src.utils.camera_util import (
-    get_zero123plus_angles
-)
+from .render import get_camera_from_views, create_face_view_map, compare_face_normals_between_views
+from src.utils.camera_util import get_zero123plus_angles
 
 def scale_latents(latents):
     latents = (latents - 0.22) * 0.75
@@ -46,6 +41,36 @@ def extract_into_tensor(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+def split_zero123plus_grid(grid_image_3x2, tile_size):
+    if len(grid_image_3x2.shape) == 3:
+        grid_image_3x2 = grid_image_3x2[None]
+
+    individual_images = []
+    for row in range(3):
+        images_col = []
+        #MJ: create two columns for each row
+        for col in range(2):
+            # Calculate the start and end indices for the slices
+            start_row = row * tile_size
+            end_row = start_row + tile_size
+            start_col = col * tile_size
+            end_col = start_col + tile_size
+
+            # Slice the tensor and add to the list
+            original_image = grid_image_3x2[:, :, start_row:end_row, start_col:end_col]
+
+            images_col.append(original_image)
+
+        individual_images.append(torch.stack(images_col, dim=1))
+
+    image_stack_mvchw = torch.cat(individual_images, dim=1)
+    image_stack = image_stack_mvchw.reshape(
+        image_stack_mvchw.shape[0] * image_stack_mvchw.shape[1],
+        -1, tile_size, tile_size
+    )
+
+    return image_stack
+
 
 class MVDiffusion(pl.LightningModule):
     def __init__(
@@ -53,6 +78,7 @@ class MVDiffusion(pl.LightningModule):
         stable_diffusion_config,
         drop_cond_prob=0.1,
         use_depth_controlnet=False,
+        use_seam_loss=False,
     ):
         super(MVDiffusion, self).__init__()
 
@@ -70,6 +96,8 @@ class MVDiffusion(pl.LightningModule):
             pipeline.add_controlnet(ControlNetModel.from_pretrained(
                 "sudo-ai/controlnet-zp11-depth-v1"
             ), conditioning_scale=0.75)
+        
+        self.use_seam_loss = use_seam_loss
 
         self.pipeline = pipeline
 
@@ -224,8 +252,9 @@ class MVDiffusion(pl.LightningModule):
             extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
         )
     
-    def compute_seam_loss(self, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx):
-        texture_img = nn.Parameter(torch.ones(1, 3, 512, 512).cuda() * 0.5)
+    def compute_seam_loss(self, pred_images_grid, target_images_grid, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx):
+        assert len(mesh_vertices) == len(mesh_faces) == len(mesh_uvs) == len(mesh_face_uvs_idx)
+        num_meshes = len(mesh_vertices)
 
         # azimuths = [0, 30, 90, 150, 210, 270, 330]
         # elevations = [0, 20, -10, 20, -10, 20, -10]
@@ -233,9 +262,10 @@ class MVDiffusion(pl.LightningModule):
         azimuths = torch.from_numpy(azimuths).to(self.device, torch.float32)
         elevations = torch.from_numpy(elevations).to(self.device, torch.float32)
 
-        mesh_renderer = Renderer(mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+        assert azimuths.shape[0] == elevations.shape[0]
+        num_viewpoints = azimuths.shape[0]
 
-        camera_transform = mesh_renderer.get_camera_from_views(
+        camera_transform = get_camera_from_views(
             torch.deg2rad(90 - elevations),
             torch.deg2rad(90 + azimuths),
             r=1.5
@@ -245,42 +275,94 @@ class MVDiffusion(pl.LightningModule):
         focal_length = 35
         fovyangle = 2 * math.atan(sensor_width / (2 * focal_length))
 
-        camera_projection = kaolin.render.camera.generate_perspective_projection(fovyangle).to(self.device)
+        camera_projection = kal.render.camera.generate_perspective_projection(fovyangle).to(self.device)
 
-        face_vertices_camera_list, face_vertices_image_list, face_normals_list = [], [], []
-        for batch_num in range(B):
+        uv_features_list, object_mask_list = [], []
+        for batch_num in range(num_meshes):
             face_vertices_camera_one_mesh, face_vertices_image_one_mesh, face_normals_one_mesh = \
-                kaolin.render.mesh.prepare_vertices(
-                    mesh_vertices[batch_num], mesh_faces[batch_num],
+                kal.render.mesh.prepare_vertices(
+                    mesh_vertices[batch_num][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
+                                                    # wih the meshes one by one.
+                    mesh_faces[batch_num],          # JA: (num_faces, face_size)
                     camera_projection,
                     camera_transform=camera_transform
                 )
+            
+            face_attributes_one_mesh = kal.ops.mesh.index_vertices_by_faces(
+                mesh_uvs[batch_num].repeat(num_viewpoints, 1, 1),
+                mesh_face_uvs_idx[batch_num].long()
+            ).detach()
 
-            face_vertices_camera_list.append(face_vertices_camera_one_mesh)
-            face_vertices_image_list.append(face_vertices_image_one_mesh)
-            face_normals_list.append(face_normals_one_mesh)
+            uv_features_one_mesh, face_idx_one_mesh = kal.render.mesh.rasterize(
+                320, 320,
+                face_vertices_camera_one_mesh[:, :, :, -1],
+                face_vertices_image_one_mesh,
+                face_attributes_one_mesh
+            )
 
-        face_vertices_camera = torch.cat(face_vertices_camera_list, dim=0)
-        face_vertices_image = torch.cat(face_vertices_image_list, dim=0)
-        face_normals = torch.cat(face_normals_list, dim=0)
+            uv_features_one_mesh = uv_features_one_mesh.detach()
 
-        face_attributes = kaolin.ops.mesh.index_vertices_by_faces(
-            mesh_uvs.repeat(6, 1, 1), #MJ: shape = (batch_size}, num_points, knum) =(1,4839,2)
-            mesh_face_uvs_idx[0].long()        #MJ: shape = num_faces,face_size)=(7500,3)
-        ).detach()
+            object_mask_one_mesh = (face_idx_one_mesh > -1).float()[..., None]
 
-        uv_features, face_idx = kaolin.render.mesh.rasterize(512, 512, face_vertices_camera[:, :, :, -1],
-            face_vertices_image, face_attributes) # JA: https://kaolin.readthedocs.io/en/latest/modules/kaolin.render.mesh.html#kaolin.render.mesh.rasterize
-        uv_features = uv_features.detach() #.permute(0, 3, 1, 2)
+            # Commented by JA: Maybe we do not need the binary masks?
+            # face_view_map_one_mesh = create_face_view_map(face_idx_one_mesh)
+            # weight_masks_one_mesh = compare_face_normals_between_views(
+            #     face_view_map_one_mesh,
+            #     face_normals_one_mesh,
+            #     face_idx_one_mesh
+            # )
 
-        mask = (face_idx > -1).float()[..., None]
+            uv_features_list.append(uv_features_one_mesh)
+            object_mask_list.append(object_mask_one_mesh)
 
-        face_view_map = mesh_renderer.create_face_view_map(face_idx)
-        weight_masks = mesh_renderer.compare_face_normals_between_views(face_view_map, face_normals, face_idx)
+        # JA:   mvchw = (mesh, vertices, channel, height, width)
+        #       bchw = (batch, channel, height, width), where batch = mesh * vertices
+        uv_features_mvchw = torch.stack(uv_features_list, dim=0)
 
-        texture_map = texture_img.expand(6, -1, -1, -1)
-        image_features = kaolin.render.mesh.texture_mapping(uv_features, texture_map, mode="bilinear")
-        image_features = image_features * mask
+        object_masks_bhwc = torch.cat(object_mask_list, dim=0)
+        object_masks_bchw = object_masks_bhwc.permute(0, 3, 1, 2)
+
+        # JA: texture_img is the module parameter representing the texture maps
+        texture_img = nn.Parameter(torch.ones(num_meshes, 3, 320, 320).cuda() * 0.5, requires_grad=True)
+        optimizer = torch.optim.Adam([texture_img], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
+        with tqdm(range(150), desc='Fitting mesh colors') as pbar:
+            for iter in pbar:
+                optimizer.zero_grad()
+
+                image_features_mvhwc_unmasked = kal.render.mesh.texture_mapping(
+                    uv_features_mvchw,
+                    texture_img,
+                    mode="bilinear"
+                )
+
+                image_features_mvchw_unmasked = image_features_mvhwc_unmasked.permute(0, 1, 4, 2, 3)
+                image_features_bchw_unmasked = image_features_mvchw_unmasked.reshape(
+                    image_features_mvchw_unmasked.shape[0] * image_features_mvchw_unmasked.shape[1],
+                    image_features_mvchw_unmasked.shape[2],
+                    image_features_mvchw_unmasked.shape[3],
+                    image_features_mvchw_unmasked.shape[4]
+                )
+
+                image_features_bchw = image_features_bchw_unmasked * object_masks_bchw
+
+                pred_images_bchw_unmasked = split_zero123plus_grid(pred_images_grid, 320)
+                pred_images = pred_images_bchw_unmasked * object_masks_bchw
+
+                loss = ((pred_images - image_features_bchw).pow(2)).mean()
+                loss.backward()
+       
+                optimizer.step()
+                print(f"{loss.item():.7f}")
+                # pbar.set_description(f"zero123plus: Fitting mesh colors -Epoch {iter}, Loss: {loss.item():.7f}")
+
+        target_images_bchw_unmasked = split_zero123plus_grid(target_images_grid, 320)
+        target_images_bchw = target_images_bchw_unmasked * object_masks_bchw
+
+        seam_loss = ((target_images_bchw - image_features_bchw).pow(2)).mean()
+
+        return seam_loss
+
+        # return rgb_render
     
     def training_step(self, batch, batch_idx):
         # get input
@@ -309,23 +391,28 @@ class MVDiffusion(pl.LightningModule):
 
         loss, loss_dict = self.compute_loss(v_pred, v_target)
 
-        seam_loss = self.compute_seam_loss(mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
-
         # logging
         self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log("global_step", self.global_step, prog_bar=True, logger=True, on_step=True, on_epoch=False)
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-        if self.global_step % 500 == 0 and self.global_rank == 0:
+        should_save_image = self.global_step % 500 == 0 and self.global_rank == 0
+        if should_save_image or self.use_seam_loss:
             with torch.no_grad():
                 latents_pred = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
 
                 latents = unscale_latents(latents_pred)
-                images = unscale_image(self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
-                images = (images * 0.5 + 0.5).clamp(0, 1)
-                images = torch.cat([target_imgs, images], dim=-2)
+                pred_images = unscale_image(self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+                pred_images = (pred_images * 0.5 + 0.5).clamp(0, 1)
 
+            if self.use_seam_loss:
+                seam_loss = self.compute_seam_loss(pred_images, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+
+                loss += seam_loss
+
+            if should_save_image:
+                images = torch.cat([target_imgs, pred_images], dim=-2)
                 grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
                 save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
 

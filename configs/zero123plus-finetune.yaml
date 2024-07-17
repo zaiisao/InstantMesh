@@ -5,10 +5,11 @@ model:
     drop_cond_prob: 0.1
 
     stable_diffusion_config:
-      pretrained_model_name_or_path: sudo-ai/zero123plus-v1.2
+      pretrained_model_name_or_path: sudo-ai/zero123plus-v1.1
       custom_pipeline: ./zero123plus
 
     use_depth_controlnet: true
+    use_seam_loss: true
 
 data:
   target: src.data.objaverse_zero123plus.DataModuleFromConfig

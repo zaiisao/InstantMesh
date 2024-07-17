@@ -82,18 +82,35 @@ class DataModuleFromConfig(pl.LightningDataModule):
             raise NotImplementedError
 
     def train_dataloader(self):
-
         sampler = DistributedSampler(self.datasets['train'])
-        return wds.WebLoader(self.datasets['train'], batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, sampler=sampler, collate_fn=collate_fn)
+        return wds.WebLoader(
+            self.datasets['train'],
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            sampler=sampler,
+            collate_fn=collate_fn
+        )
 
     def val_dataloader(self):
-
         sampler = DistributedSampler(self.datasets['validation'])
-        return wds.WebLoader(self.datasets['validation'], batch_size=4, num_workers=self.num_workers, shuffle=False, sampler=sampler, collate_fn=collate_fn)
+        return wds.WebLoader(
+            self.datasets['validation'],
+            batch_size=4,
+            num_workers=self.num_workers,
+            shuffle=False,
+            sampler=sampler,
+            collate_fn=collate_fn
+        )
 
     def test_dataloader(self):
-
-        return wds.WebLoader(self.datasets['test'], batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, collate_fn=collate_fn)
+        return wds.WebLoader(
+            self.datasets['test'],
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            collate_fn=collate_fn
+        )
 
 
 class ObjaverseData(Dataset):
@@ -195,9 +212,14 @@ class ObjaverseData(Dataset):
         
         imgs = torch.stack(img_list, dim=0).float()
         depths = torch.stack(depth_list, dim=0).float()
-        
+
+        # JA: The modified dataset format includes the .glb file in each folder
         mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
         mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(mesh_path)
+
+        # Commented by JA: Including the mesh vertices, faces, etc. here will not work because they have varying lengths.
+        # This requires us to return the values themselves, so that they can be handled in the collate_fn with the usage
+        # of padding the shorter tensors to match the length of the longest tensor
 
         # data = {
         #     'cond_imgs': imgs[0],           # (3, H, W)
