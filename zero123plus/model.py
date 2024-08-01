@@ -252,6 +252,50 @@ class MVDiffusion(pl.LightningModule):
             extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
         )
     
+    def interpolate_texture(self, uv_features_mvchw, texture_maps):
+        interpolated_texture_mvhwc_unmasked = kal.render.mesh.texture_mapping(
+            uv_features_mvchw,
+            texture_maps,
+            mode="bilinear"
+        )
+
+        interpolated_texture_mvchw_unmasked = interpolated_texture_mvhwc_unmasked.permute(0, 1, 4, 2, 3)
+        interpolated_texture_bchw_unmasked = interpolated_texture_mvchw_unmasked.reshape(
+            interpolated_texture_mvchw_unmasked.shape[0] * interpolated_texture_mvchw_unmasked.shape[1],
+            interpolated_texture_mvchw_unmasked.shape[2],
+            interpolated_texture_mvchw_unmasked.shape[3],
+            interpolated_texture_mvchw_unmasked.shape[4]
+        )
+
+        return interpolated_texture_bchw_unmasked
+    
+    def produce_texture_maps(
+        self,
+        num_meshes,
+        uv_features_mvchw,
+        zero123plus_images_bchw_unmasked,
+        object_masks_bchw
+    ):
+        # JA: texture_img is the module parameter representing the texture maps
+        texture_maps = nn.Parameter(torch.ones(num_meshes, 3, 320, 320).cuda() * 0.5, requires_grad=True)
+        optimizer = torch.optim.Adam([texture_maps], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
+        with tqdm(range(150), desc='Fitting mesh colors') as pbar:
+            for iter in pbar:
+                optimizer.zero_grad()
+
+                interpolated_texture_bchw_unmasked = self.interpolate_texture(uv_features_mvchw, texture_maps)
+
+                interpolated_texture_bchw = interpolated_texture_bchw_unmasked * object_masks_bchw
+                zero123plus_images_bchw = zero123plus_images_bchw_unmasked * object_masks_bchw
+
+                loss = ((zero123plus_images_bchw - interpolated_texture_bchw).pow(2)).mean()
+                loss.backward()
+       
+                optimizer.step()
+                print(f"{loss.item():.7f}")
+
+        return texture_maps, interpolated_texture_bchw
+
     def compute_seam_loss(
         self,
         pred_images_grid,
@@ -330,38 +374,11 @@ class MVDiffusion(pl.LightningModule):
         object_masks_bhwc = torch.cat(object_mask_list, dim=0)
         object_masks_bchw = object_masks_bhwc.permute(0, 3, 1, 2)
 
-        # JA: texture_img is the module parameter representing the texture maps
-        texture_img = nn.Parameter(torch.ones(num_meshes, 3, 320, 320).cuda() * 0.5, requires_grad=True)
-        optimizer = torch.optim.Adam([texture_img], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
-        with tqdm(range(150), desc='Fitting mesh colors') as pbar:
-            for iter in pbar:
-                optimizer.zero_grad()
+        pred_images_bchw_unmasked = split_zero123plus_grid(pred_images_grid, 320)
 
-                image_features_mvhwc_unmasked = kal.render.mesh.texture_mapping(
-                    uv_features_mvchw,
-                    texture_img,
-                    mode="bilinear"
-                )
-
-                image_features_mvchw_unmasked = image_features_mvhwc_unmasked.permute(0, 1, 4, 2, 3)
-                image_features_bchw_unmasked = image_features_mvchw_unmasked.reshape(
-                    image_features_mvchw_unmasked.shape[0] * image_features_mvchw_unmasked.shape[1],
-                    image_features_mvchw_unmasked.shape[2],
-                    image_features_mvchw_unmasked.shape[3],
-                    image_features_mvchw_unmasked.shape[4]
-                )
-
-                image_features_bchw = image_features_bchw_unmasked * object_masks_bchw
-
-                pred_images_bchw_unmasked = split_zero123plus_grid(pred_images_grid, 320)
-                pred_images = pred_images_bchw_unmasked * object_masks_bchw
-
-                loss = ((pred_images - image_features_bchw).pow(2)).mean()
-                loss.backward()
-       
-                optimizer.step()
-                print(f"{loss.item():.7f}")
-                # pbar.set_description(f"zero123plus: Fitting mesh colors -Epoch {iter}, Loss: {loss.item():.7f}")
+        _, image_features_bchw = self.produce_texture_maps(
+            num_meshes, uv_features_mvchw, pred_images_bchw_unmasked, object_masks_bchw
+        )
 
         target_images_bchw_unmasked = split_zero123plus_grid(target_images_grid, 320)
         target_images_bchw = target_images_bchw_unmasked * object_masks_bchw
