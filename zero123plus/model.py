@@ -321,7 +321,7 @@ class MVDiffusion(pl.LightningModule):
             torch.deg2rad(90 - elevations),
             torch.deg2rad(90 + azimuths),
             r=1.5
-        )
+        ) # JA: shape = (6, 4, 3)
 
         sensor_width = 32
         focal_length = 35
@@ -330,19 +330,19 @@ class MVDiffusion(pl.LightningModule):
         camera_projection = kal.render.camera.generate_perspective_projection(fovyangle).to(self.device)
 
         uv_features_list, object_mask_list = [], []
-        for batch_num in range(num_meshes):
+        for mesh_id in range(num_meshes):
             face_vertices_camera_one_mesh, face_vertices_image_one_mesh, face_normals_one_mesh = \
                 kal.render.mesh.prepare_vertices(
-                    mesh_vertices[batch_num][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
+                    mesh_vertices[mesh_id][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
                                                     # wih the meshes one by one.
-                    mesh_faces[batch_num],          # JA: (num_faces, face_size)
+                    mesh_faces[mesh_id],          # JA: (num_faces, face_size)
                     camera_projection,
                     camera_transform=camera_transform
                 )
             
             face_attributes_one_mesh = kal.ops.mesh.index_vertices_by_faces(
-                mesh_uvs[batch_num].repeat(num_viewpoints, 1, 1),
-                mesh_face_uvs_idx[batch_num].long()
+                mesh_uvs[mesh_id].repeat(num_viewpoints, 1, 1),
+                mesh_face_uvs_idx[mesh_id].long()
             ).detach()
 
             uv_features_one_mesh, face_idx_one_mesh = kal.render.mesh.rasterize(
@@ -367,8 +367,8 @@ class MVDiffusion(pl.LightningModule):
             uv_features_list.append(uv_features_one_mesh)
             object_mask_list.append(object_mask_one_mesh)
 
-        # JA:   mvchw = (mesh, vertices, channel, height, width)
-        #       bchw = (batch, channel, height, width), where batch = mesh * vertices
+        # JA:   mvchw = (mesh, viewpoints, channel, height, width)
+        #       bchw = (batch, channel, height, width), where batch = mesh * viewpoints
         uv_features_mvchw = torch.stack(uv_features_list, dim=0)
 
         object_masks_bhwc = torch.cat(object_mask_list, dim=0)

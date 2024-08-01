@@ -36,7 +36,7 @@ def collate_fn(data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.
     padded_mesh_vertices = pad_tensors(mesh_vertices)
     padded_mesh_faces = pad_tensors(mesh_faces)
     padded_mesh_uvs = pad_tensors(mesh_uvs)
-    padded_mesh_face_uvs_idx = pad_tensors(mesh_face_uvs_idx)
+    padded_mesh_face_uvs_idx = pad_tensors(mesh_face_uvs_idx) # (num_faces, 3)
 
     data = {
         'cond_imgs': torch.stack(cond_imgs),
