@@ -252,7 +252,15 @@ class MVDiffusion(pl.LightningModule):
             extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
         )
     
-    def compute_seam_loss(self, pred_images_grid, target_images_grid, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx):
+    def compute_seam_loss(
+        self,
+        pred_images_grid,
+        target_images_grid,
+        mesh_vertices,
+        mesh_faces,
+        mesh_uvs,
+        mesh_face_uvs_idx
+    ):
         assert len(mesh_vertices) == len(mesh_faces) == len(mesh_uvs) == len(mesh_face_uvs_idx)
         num_meshes = len(mesh_vertices)
 
