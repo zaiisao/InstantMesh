@@ -33,20 +33,15 @@ def pad_tensors(tensor_list, pad_value=-1):
 def collate_fn(data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     cond_imgs, target_imgs, target_depth_img, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = zip(*data)
 
-    padded_mesh_vertices = pad_tensors(mesh_vertices)
-    padded_mesh_faces = pad_tensors(mesh_faces)
-    padded_mesh_uvs = pad_tensors(mesh_uvs)
-    padded_mesh_face_uvs_idx = pad_tensors(mesh_face_uvs_idx) # (num_faces, 3)
-
     data = {
         'cond_imgs': torch.stack(cond_imgs),
         'target_imgs': torch.stack(target_imgs),
         'target_depth_imgs': torch.stack(target_depth_img),
 
-        'padded_mesh_vertices': torch.stack(padded_mesh_vertices),
-        'padded_mesh_faces': torch.stack(padded_mesh_faces),
-        'padded_mesh_uvs': torch.stack(padded_mesh_uvs),
-        'padded_mesh_face_uvs_idx': torch.stack(padded_mesh_face_uvs_idx)
+        'mesh_vertices': mesh_vertices,
+        'mesh_faces': mesh_faces,
+        'mesh_uvs': mesh_uvs,
+        'mesh_face_uvs_idx': mesh_face_uvs_idx
     }
 
     return data

@@ -164,29 +164,10 @@ class MVDiffusion(pl.LightningModule):
         target_depth_imgs = rearrange(target_depth_imgs, 'b (x y) c h w -> b c (x h) (y w)', x=3, y=2)    # (B, C, 3H, 2W)
         target_depth_imgs = target_depth_imgs.to(self.device)
 
-        num_viewpoints = target_imgs.shape[1]
-
-        padded_mesh_vertices = batch['padded_mesh_vertices']#[:, None].repeat(1, num_viewpoints, 1, 1)
-        padded_mesh_faces = batch['padded_mesh_faces']
-        padded_mesh_uvs = batch['padded_mesh_uvs']
-        padded_mesh_face_uvs_idx = batch['padded_mesh_face_uvs_idx']
-
-        def unpad_tensors(padded_tensors, pad_value=-1):
-            unpadded_tensors = []
-            
-            for tensor in padded_tensors:
-                # Find the length of valid data by looking for the first occurrence of the pad_value
-                valid_length = (tensor != pad_value).all(dim=1).nonzero(as_tuple=True)[0].max().item() + 1
-                # Slice the tensor up to the valid length
-                unpadded_tensor = tensor[:valid_length]
-                unpadded_tensors.append(unpadded_tensor)
-            
-            return unpadded_tensors
-        
-        mesh_vertices = unpad_tensors(padded_mesh_vertices)
-        mesh_faces = unpad_tensors(padded_mesh_faces)
-        mesh_uvs = unpad_tensors(padded_mesh_uvs)
-        mesh_face_uvs_idx = unpad_tensors(padded_mesh_face_uvs_idx)
+        mesh_vertices = batch['mesh_vertices']
+        mesh_faces = batch['mesh_faces']
+        mesh_uvs = batch['mesh_uvs']
+        mesh_face_uvs_idx = batch['mesh_face_uvs_idx']
 
         return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
     
@@ -252,41 +233,54 @@ class MVDiffusion(pl.LightningModule):
             extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
         )
     
-    def interpolate_texture(self, uv_features_mvchw, texture_maps):
-        interpolated_texture_mvhwc_unmasked = kal.render.mesh.texture_mapping(
-            uv_features_mvchw,
-            texture_maps,
+    def texture_mapping(self, uv_features_mvhwc, texture_maps_mchw):
+        uv_features_bhwc = uv_features_mvhwc.reshape(
+            uv_features_mvhwc.shape[0] * uv_features_mvhwc.shape[1],
+            uv_features_mvhwc.shape[2],
+            uv_features_mvhwc.shape[3],
+            uv_features_mvhwc.shape[4]
+        )
+
+        num_viewpoints = uv_features_mvhwc.shape[1]
+        texture_maps_bchw = texture_maps_mchw.repeat_interleave(num_viewpoints, dim=0)
+
+        interpolated_textures_bhwc = kal.render.mesh.texture_mapping(
+            uv_features_bhwc,    # (12, h, w, 2)
+            texture_maps_bchw,   # (12, 3, h', w')
             mode="bilinear"
         )
 
-        interpolated_texture_mvchw_unmasked = interpolated_texture_mvhwc_unmasked.permute(0, 1, 4, 2, 3)
-        interpolated_texture_bchw_unmasked = interpolated_texture_mvchw_unmasked.reshape(
-            interpolated_texture_mvchw_unmasked.shape[0] * interpolated_texture_mvchw_unmasked.shape[1],
-            interpolated_texture_mvchw_unmasked.shape[2],
-            interpolated_texture_mvchw_unmasked.shape[3],
-            interpolated_texture_mvchw_unmasked.shape[4]
-        )
-
-        return interpolated_texture_bchw_unmasked
+        return interpolated_textures_bhwc
     
     def produce_texture_maps(
         self,
         num_meshes,
-        uv_features_mvchw,
-        zero123plus_images_bchw_unmasked,
+        uv_features_mvhwc,
+        pred_images_bchw_before_masking,
         object_masks_bchw
     ):
-        # JA: texture_img is the module parameter representing the texture maps
-        texture_maps = nn.Parameter(torch.ones(num_meshes, 3, 320, 320).cuda() * 0.5, requires_grad=True)
+        # JA: This function learns the texture maps for a number of meshes (in our case, 2) using the six multiview images
+        # predicted from random t and the cond image at random t. There is only one texture global texture map for the
+        # whole mesh. This enables us to maintain the consistency among the images over multiple regions on the mesh. The
+        # target 3x2 images for the cond image in Zero123++ are self-consistent, but in the process of learning the UNet
+        # of Zero123++, the self-consistency may not be maintained. But, this self-consistency can be maintained if we
+        # keep track of the global texture map for the six images being generated.
+        # The neural network for learning the texture maps is different from the Zero123++ UNet learning
+
+        # JA: Initialize the learnable parameter texture maps
+        texture_maps = nn.Parameter(torch.ones(num_meshes, 3, 1200, 1200).cuda() * 0.5, requires_grad=True)
         optimizer = torch.optim.Adam([texture_maps], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
+
+        # JA: Optimize the learnable parameters by dynamically constructing the neural network for the loss
         with tqdm(range(150), desc='Fitting mesh colors') as pbar:
             for iter in pbar:
                 optimizer.zero_grad()
 
-                interpolated_texture_bchw_unmasked = self.interpolate_texture(uv_features_mvchw, texture_maps)
+                interpolated_texture_bhwc_before_masking = self.texture_mapping(uv_features_mvhwc, texture_maps)
+                interpolated_texture_bchw_before_masking = interpolated_texture_bhwc_before_masking.permute(0, 3, 1, 2)
 
-                interpolated_texture_bchw = interpolated_texture_bchw_unmasked * object_masks_bchw
-                zero123plus_images_bchw = zero123plus_images_bchw_unmasked * object_masks_bchw
+                interpolated_texture_bchw = interpolated_texture_bchw_before_masking * object_masks_bchw
+                zero123plus_images_bchw = pred_images_bchw_before_masking * object_masks_bchw
 
                 loss = ((zero123plus_images_bchw - interpolated_texture_bchw).pow(2)).mean()
                 loss.backward()
@@ -335,22 +329,23 @@ class MVDiffusion(pl.LightningModule):
                 kal.render.mesh.prepare_vertices(
                     mesh_vertices[mesh_id][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
                                                     # wih the meshes one by one.
-                    mesh_faces[mesh_id],          # JA: (num_faces, face_size)
+                    mesh_faces[mesh_id],          # JA: (num_faces, face_size) = (30000, 3)
                     camera_projection,
                     camera_transform=camera_transform
-                )
+                ) # JA: shape of face_vertices_camera_one_mesh, face_vertices_image_one_mesh: (6, 30000, 3, 2)
             
             face_attributes_one_mesh = kal.ops.mesh.index_vertices_by_faces(
                 mesh_uvs[mesh_id].repeat(num_viewpoints, 1, 1),
                 mesh_face_uvs_idx[mesh_id].long()
-            ).detach()
+            ).detach() # JA: Face attributes include the vertices of each face and the UV coordinates of each face
 
             uv_features_one_mesh, face_idx_one_mesh = kal.render.mesh.rasterize(
-                320, 320,
+                320, 320, # JA: Zero123++ assumes each image size is 320x320
                 face_vertices_camera_one_mesh[:, :, :, -1],
                 face_vertices_image_one_mesh,
                 face_attributes_one_mesh
-            )
+            )   # JA: uv_features_one_mesh.shape = (6, 320, 320, 2): 
+                # It defines the UV coordinates of the texture map, to be assigned to each pixel ij of the rasterized image.
 
             uv_features_one_mesh = uv_features_one_mesh.detach()
 
@@ -369,19 +364,19 @@ class MVDiffusion(pl.LightningModule):
 
         # JA:   mvchw = (mesh, viewpoints, channel, height, width)
         #       bchw = (batch, channel, height, width), where batch = mesh * viewpoints
-        uv_features_mvchw = torch.stack(uv_features_list, dim=0)
+        uv_features_mvhwc = torch.stack(uv_features_list, dim=0)
 
         object_masks_bhwc = torch.cat(object_mask_list, dim=0)
         object_masks_bchw = object_masks_bhwc.permute(0, 3, 1, 2)
 
-        pred_images_bchw_unmasked = split_zero123plus_grid(pred_images_grid, 320)
+        pred_images_bchw_before_masking = split_zero123plus_grid(pred_images_grid, 320)
 
-        _, image_features_bchw = self.produce_texture_maps(
-            num_meshes, uv_features_mvchw, pred_images_bchw_unmasked, object_masks_bchw
+        texture_maps, image_features_bchw = self.produce_texture_maps( # JA: Produce the texture atlas using the multiview images
+            num_meshes, uv_features_mvhwc, pred_images_bchw_before_masking, object_masks_bchw
         )
 
-        target_images_bchw_unmasked = split_zero123plus_grid(target_images_grid, 320)
-        target_images_bchw = target_images_bchw_unmasked * object_masks_bchw
+        target_images_bchw_before_masking = split_zero123plus_grid(target_images_grid, 320)
+        target_images_bchw = target_images_bchw_before_masking * object_masks_bchw
 
         seam_loss = ((target_images_bchw - image_features_bchw).pow(2)).mean()
 
@@ -389,6 +384,7 @@ class MVDiffusion(pl.LightningModule):
 
         # return rgb_render
     
+    # JA: The purpose of the training step is to predict the x_0 from x_t and t.
     def training_step(self, batch, batch_idx):
         # get input
         cond_imgs, target_imgs, target_depth_imgs, \
@@ -397,6 +393,7 @@ class MVDiffusion(pl.LightningModule):
         # sample random timestep
         B = cond_imgs.shape[0]
         
+        # JA: Choose random t for each item in the batch
         t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
 
         # classifier-free guidance
@@ -414,10 +411,12 @@ class MVDiffusion(pl.LightningModule):
         v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
         v_target = self.get_v(latents, noise, t)
 
-        loss, loss_dict = self.compute_loss(v_pred, v_target)
+        reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
+
+        total_loss = reconstruct_loss
 
         # logging
-        self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log("global_step", self.global_step, prog_bar=True, logger=True, on_step=True, on_epoch=False)
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
@@ -425,23 +424,23 @@ class MVDiffusion(pl.LightningModule):
         should_save_image = self.global_step % 500 == 0 and self.global_rank == 0
         if should_save_image or self.use_seam_loss:
             with torch.no_grad():
-                latents_pred = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+                latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
 
-                latents = unscale_latents(latents_pred)
-                pred_images = unscale_image(self.pipeline.vae.decode(latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
-                pred_images = (pred_images * 0.5 + 0.5).clamp(0, 1)
+                latents_0 = unscale_latents(latents_pred_0)
+                pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+                pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
 
             if self.use_seam_loss:
-                seam_loss = self.compute_seam_loss(pred_images, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+                seam_loss = self.compute_seam_loss(pred_images_0, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
 
-                loss += seam_loss
+                total_loss += seam_loss
 
             if should_save_image:
-                images = torch.cat([target_imgs, pred_images], dim=-2)
+                images = torch.cat([target_imgs, pred_images_0], dim=-2)
                 grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
                 save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
 
-        return loss
+        return total_loss # JA: PyTorch Lightning takes care of optimizing the loss
         
     def compute_loss(self, noise_pred, noise_gt):
         loss = F.mse_loss(noise_pred, noise_gt)
