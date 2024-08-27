@@ -146,39 +146,44 @@ class ObjaverseData(Dataset):
         alpha = torch.from_numpy(alpha).permute(2, 0, 1).contiguous().float()
         return image, alpha
     
-    def load_mesh(self, mesh_path):
-        mesh = kaolin.io.gltf.import_mesh(mesh_path)
+    def load_mesh(self, image_path):
+        # mesh = kaolin.io.gltf.import_mesh(mesh_path)
 
-        def normalize_mesh(vertices):
-            # Compute bounding box
-            bbox_min = torch.min(vertices, dim=0).values
-            bbox_max = torch.max(vertices, dim=0).values
+        # def normalize_mesh(vertices):
+        #     # Compute bounding box
+        #     bbox_min = torch.min(vertices, dim=0).values
+        #     bbox_max = torch.max(vertices, dim=0).values
             
-            # Compute scale factor to fit within unit cube
-            scale = 1.0 / torch.max(bbox_max - bbox_min)
+        #     # Compute scale factor to fit within unit cube
+        #     scale = 1.0 / torch.max(bbox_max - bbox_min)
             
-            # Scale vertices
-            scaled_vertices = vertices * scale
+        #     # Scale vertices
+        #     scaled_vertices = vertices * scale
             
-            # Recompute bounding box after scaling
-            bbox_min = torch.min(scaled_vertices, dim=0).values
-            bbox_max = torch.max(scaled_vertices, dim=0).values
+        #     # Recompute bounding box after scaling
+        #     bbox_min = torch.min(scaled_vertices, dim=0).values
+        #     bbox_max = torch.max(scaled_vertices, dim=0).values
 
-            # Compute translation to center mesh at origin
-            bbox_center = (bbox_min + bbox_max) / 2.0
+        #     # Compute translation to center mesh at origin
+        #     bbox_center = (bbox_min + bbox_max) / 2.0
 
-            # Translate vertices
-            vertices_from_bbox_center = scaled_vertices - bbox_center
+        #     # Translate vertices
+        #     vertices_from_bbox_center = scaled_vertices - bbox_center
 
-            # JA: scaled_vertices on the right-hand side refers to the coordiantes of the vertices from
-            # the world coordinate system
+        #     # JA: scaled_vertices on the right-hand side refers to the coordiantes of the vertices from
+        #     # the world coordinate system
 
-            return vertices_from_bbox_center
+        #     return vertices_from_bbox_center
         
-        mesh_vertices = normalize_mesh(mesh.vertices)
-        mesh_faces = mesh.faces
-        mesh_uvs = mesh.uvs
-        mesh_face_uvs_idx = mesh.face_uvs_idx
+        # mesh_vertices = normalize_mesh(mesh.vertices)
+        # mesh_faces = mesh.faces
+        # mesh_uvs = mesh.uvs
+        # mesh_face_uvs_idx = mesh.face_uvs_idx
+
+        mesh_vertices = torch.load(os.path.join(image_path, 'mesh_vertices.pt'))
+        mesh_faces = torch.load(os.path.join(image_path, 'mesh_faces.pt'))
+        mesh_uvs = torch.load(os.path.join(image_path, 'mesh_uvs.pt'))
+        mesh_face_uvs_idx = torch.load(os.path.join(image_path, 'mesh_face_uvs_idx.pt'))
 
         return mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
 
@@ -209,8 +214,8 @@ class ObjaverseData(Dataset):
         depths = torch.stack(depth_list, dim=0).float()
 
         # JA: The modified dataset format includes the .glb file in each folder
-        mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
-        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(mesh_path)
+        # mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
+        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(image_path)
 
         # Commented by JA: Including the mesh vertices, faces, etc. here will not work because they have varying lengths.
         # This requires us to return the values themselves, so that they can be handled in the collate_fn with the usage

@@ -19,16 +19,16 @@ data:
     train:
       target: src.data.objaverse_zero123plus.ObjaverseData
       params:
-        root_dir: data/objaverse
-        meta_fname: lvis-annotations.json
-        image_dir: rendering_zero123plus
+        root_dir: /home/sogang/mnt/db_1/jaehoon/objaverse/zero123plus-dataset #/000-000 # data/objaverse
+        meta_fname: 000-000/lvis-annotations.json
+        image_dir: 000-000 # rendering_zero123plus
         validation: false
     validation:
       target: src.data.objaverse_zero123plus.ObjaverseData
       params:
-        root_dir: data/objaverse
-        meta_fname: lvis-annotations.json
-        image_dir: rendering_zero123plus
+        root_dir: /home/sogang/mnt/db_1/jaehoon/objaverse/zero123plus-dataset #/000-000 # data/objaverse
+        meta_fname: 000-000/lvis-annotations.json
+        image_dir: 000-000 # rendering_zero123plus
         validation: true
 
 

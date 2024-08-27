@@ -286,9 +286,9 @@ class MVDiffusion(pl.LightningModule):
                 loss.backward()
        
                 optimizer.step()
-                print(f"{loss.item():.7f}")
+                # print(f"{loss.item():.7f}")
 
-        return texture_maps, interpolated_texture_bchw
+        return texture_maps.detach(), interpolated_texture_bchw.detach()
 
     def compute_seam_loss(
         self,
@@ -409,36 +409,62 @@ class MVDiffusion(pl.LightningModule):
         latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
         
         v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
-        v_target = self.get_v(latents, noise, t)
+        # v_target = self.get_v(latents, noise, t)
 
-        reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
+        # reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
 
-        total_loss = reconstruct_loss
+        # total_loss = reconstruct_loss
 
         # logging
-        self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        # self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log("global_step", self.global_step, prog_bar=True, logger=True, on_step=True, on_epoch=False)
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-        should_save_image = self.global_step % 500 == 0 and self.global_rank == 0
-        if should_save_image or self.use_seam_loss:
+        # if self.global_step % 500 == 0 and self.global_rank == 0:
+        # # if self.use_seam_loss or (self.global_step % 500 == 0 and self.global_rank == 0):
+        #     with torch.no_grad():
+        #         latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+
+        #         latents_0 = unscale_latents(latents_pred_0)
+        #         pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+        #         pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
+
+        #     # if self.use_seam_loss:
+        #     #     seam_loss = self.compute_seam_loss(pred_images_0, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+
+        #     #     total_loss = seam_loss
+
+        #     if self.global_step % 500 == 0 and self.global_rank == 0:
+        #         images = torch.cat([target_imgs, pred_images_0], dim=-2)
+        #         grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
+        #         save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
+
+        if self.use_seam_loss:
+            # for param in self.pipeline.vae.parameters():
+            #     param.requires_grad = False
+
+            # self.pipeline.vae.eval()
+
+            latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+
+            latents_0 = unscale_latents(latents_pred_0)
+
             with torch.no_grad():
-                latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+                decoded_image_0 = self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
 
-                latents_0 = unscale_latents(latents_pred_0)
-                pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
-                pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
+            pred_images_0 = unscale_image(decoded_image_0)   # [-1, 1]
+            pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
 
-            if self.use_seam_loss:
-                seam_loss = self.compute_seam_loss(pred_images_0, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+            # self.pipeline.vae.train()
 
-                total_loss += seam_loss
+            # for param in self.pipeline.vae.parameters():
+            #     param.requires_grad = True
 
-            if should_save_image:
-                images = torch.cat([target_imgs, pred_images_0], dim=-2)
-                grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
-                save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
+            seam_loss = self.compute_seam_loss(pred_images_0, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+
+            # total_loss += seam_loss
+            total_loss = seam_loss
 
         return total_loss # JA: PyTorch Lightning takes care of optimizing the loss
         
