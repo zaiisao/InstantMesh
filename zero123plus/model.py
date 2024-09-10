@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import pytorch_lightning as pl
 import math
 import kaolin as kal
@@ -10,6 +11,7 @@ from torchvision.transforms import v2
 from torchvision.utils import make_grid, save_image
 from einops import rearrange
 from tqdm import tqdm
+from contextlib import contextmanager
 
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel, ControlNetModel
 from .pipeline import RefOnlyNoisedUNet
@@ -20,21 +22,17 @@ def scale_latents(latents):
     latents = (latents - 0.22) * 0.75
     return latents
 
-
 def unscale_latents(latents):
     latents = latents / 0.75 + 0.22
     return latents
-
 
 def scale_image(image):
     image = image * 0.5 / 0.8
     return image
 
-
 def unscale_image(image):
     image = image / 0.5 * 0.8
     return image
-
 
 def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
@@ -71,6 +69,21 @@ def split_zero123plus_grid(grid_image_3x2, tile_size):
 
     return image_stack
 
+@contextmanager
+def freeze_module(module):
+    # Store original requires_grad state
+    original_states = [param.requires_grad for param in module.parameters()]
+    
+    # Set requires_grad to False to freeze the module
+    for param in module.parameters():
+        param.requires_grad = False
+    
+    try:
+        yield  # This allows the code inside the context to run
+    finally:
+        # Restore the original requires_grad state
+        for param, state in zip(module.parameters(), original_states):
+            param.requires_grad = state
 
 class MVDiffusion(pl.LightningModule):
     def __init__(
@@ -282,13 +295,13 @@ class MVDiffusion(pl.LightningModule):
                 interpolated_texture_bchw = interpolated_texture_bchw_before_masking * object_masks_bchw
                 zero123plus_images_bchw = pred_images_bchw_before_masking * object_masks_bchw
 
-                loss = ((zero123plus_images_bchw - interpolated_texture_bchw).pow(2)).mean()
-                loss.backward()
+                loss = ((zero123plus_images_bchw.detach() - interpolated_texture_bchw).pow(2)).mean()
+                loss.backward(retain_graph=True)
        
                 optimizer.step()
                 # print(f"{loss.item():.7f}")
 
-        return texture_maps.detach(), interpolated_texture_bchw.detach()
+        return texture_maps, interpolated_texture_bchw
 
     def compute_seam_loss(
         self,
@@ -325,6 +338,10 @@ class MVDiffusion(pl.LightningModule):
 
         uv_features_list, object_mask_list = [], []
         for mesh_id in range(num_meshes):
+            if (mesh_vertices[mesh_id] is None or mesh_faces[mesh_id] is None or \
+                    mesh_uvs[mesh_id] is None or mesh_face_uvs_idx[mesh_id] is None):
+                continue
+
             face_vertices_camera_one_mesh, face_vertices_image_one_mesh, face_normals_one_mesh = \
                 kal.render.mesh.prepare_vertices(
                     mesh_vertices[mesh_id][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
@@ -441,27 +458,26 @@ class MVDiffusion(pl.LightningModule):
         #         save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
 
         if self.use_seam_loss:
-            # for param in self.pipeline.vae.parameters():
-            #     param.requires_grad = False
-
-            # self.pipeline.vae.eval()
-
             latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
-
             latents_0 = unscale_latents(latents_pred_0)
 
-            with torch.no_grad():
-                decoded_image_0 = self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
+            with freeze_module(self.pipeline.vae):
+                self.pipeline.vae.eval()
+
+                decoded_image_0 = checkpoint( # JA: Apply checkpoint in function call of self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
+                    lambda x: self.pipeline.vae.decode(x, return_dict=False)[0],
+                    latents_0 / self.pipeline.vae.config.scaling_factor
+                )
+
+                self.pipeline.vae.train()
 
             pred_images_0 = unscale_image(decoded_image_0)   # [-1, 1]
             pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
 
-            # self.pipeline.vae.train()
-
-            # for param in self.pipeline.vae.parameters():
-            #     param.requires_grad = True
-
-            seam_loss = self.compute_seam_loss(pred_images_0, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+            seam_loss = self.compute_seam_loss(
+                pred_images_0, target_imgs,
+                mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
+            )
 
             # total_loss += seam_loss
             total_loss = seam_loss
