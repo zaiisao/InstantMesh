@@ -177,10 +177,12 @@ class MVDiffusion(pl.LightningModule):
         target_depth_imgs = rearrange(target_depth_imgs, 'b (x y) c h w -> b c (x h) (y w)', x=3, y=2)    # (B, C, 3H, 2W)
         target_depth_imgs = target_depth_imgs.to(self.device)
 
-        mesh_vertices = batch['mesh_vertices']
-        mesh_faces = batch['mesh_faces']
-        mesh_uvs = batch['mesh_uvs']
-        mesh_face_uvs_idx = batch['mesh_face_uvs_idx']
+        mesh_vertices = list(batch['mesh_vertices'])
+        mesh_faces = list(batch['mesh_faces'])
+        mesh_uvs = list(batch['mesh_uvs'])
+        mesh_face_uvs_idx = list(batch['mesh_face_uvs_idx'])
+
+        # print(batch["image_path"])
 
         return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
     
@@ -285,23 +287,24 @@ class MVDiffusion(pl.LightningModule):
         optimizer = torch.optim.Adam([texture_maps], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
 
         # JA: Optimize the learnable parameters by dynamically constructing the neural network for the loss
-        with tqdm(range(150), desc='Fitting mesh colors') as pbar:
-            for iter in pbar:
-                optimizer.zero_grad()
+        # with tqdm(range(150), desc='Fitting mesh colors') as pbar:
+            # for iter in pbar:
+        for i in range(150):
+            optimizer.zero_grad()
 
-                interpolated_texture_bhwc_before_masking = self.texture_mapping(uv_features_mvhwc, texture_maps)
-                interpolated_texture_bchw_before_masking = interpolated_texture_bhwc_before_masking.permute(0, 3, 1, 2)
+            interpolated_texture_bhwc_before_masking = self.texture_mapping(uv_features_mvhwc, texture_maps)
+            interpolated_texture_bchw_before_masking = interpolated_texture_bhwc_before_masking.permute(0, 3, 1, 2)
 
-                interpolated_texture_bchw = interpolated_texture_bchw_before_masking * object_masks_bchw
-                zero123plus_images_bchw = pred_images_bchw_before_masking * object_masks_bchw
+            interpolated_texture_bchw = interpolated_texture_bchw_before_masking * object_masks_bchw
+            zero123plus_images_bchw = pred_images_bchw_before_masking * object_masks_bchw
 
-                loss = ((zero123plus_images_bchw.detach() - interpolated_texture_bchw).pow(2)).mean()
-                loss.backward(retain_graph=True)
-       
-                optimizer.step()
-                # print(f"{loss.item():.7f}")
+            loss = ((zero123plus_images_bchw.detach() - interpolated_texture_bchw).pow(2)).mean()
+            loss.backward(retain_graph=True)
+    
+            optimizer.step()
+            # print(f"{loss.item():.7f}")
 
-        return texture_maps, interpolated_texture_bchw
+        return texture_maps.detach(), interpolated_texture_bchw
 
     def compute_seam_loss(
         self,
@@ -312,8 +315,26 @@ class MVDiffusion(pl.LightningModule):
         mesh_uvs,
         mesh_face_uvs_idx
     ):
-        assert len(mesh_vertices) == len(mesh_faces) == len(mesh_uvs) == len(mesh_face_uvs_idx)
+        # JA: Filter out problematic meshes where any component is None
+        valid_indices = [i for i in range(len(mesh_vertices)) if 
+                        mesh_vertices[i] is not None and 
+                        mesh_faces[i] is not None and 
+                        mesh_uvs[i] is not None and 
+                        mesh_face_uvs_idx[i] is not None]
+
+        if len(valid_indices) == 0:
+            return None
+
+        # JA: Use the valid indices to create new filtered lists
+        pred_images_grid = pred_images_grid[valid_indices]
+        target_images_grid = target_images_grid[valid_indices]
+        mesh_vertices = [mesh_vertices[i] for i in valid_indices]
+        mesh_faces = [mesh_faces[i] for i in valid_indices]
+        mesh_uvs = [mesh_uvs[i] for i in valid_indices]
+        mesh_face_uvs_idx = [mesh_face_uvs_idx[i] for i in valid_indices]
+
         num_meshes = len(mesh_vertices)
+        assert len(mesh_vertices) == len(mesh_faces) == len(mesh_uvs) == len(mesh_face_uvs_idx)
 
         # azimuths = [0, 30, 90, 150, 210, 270, 330]
         # elevations = [0, 20, -10, 20, -10, 20, -10]
@@ -338,10 +359,6 @@ class MVDiffusion(pl.LightningModule):
 
         uv_features_list, object_mask_list = [], []
         for mesh_id in range(num_meshes):
-            if (mesh_vertices[mesh_id] is None or mesh_faces[mesh_id] is None or \
-                    mesh_uvs[mesh_id] is None or mesh_face_uvs_idx[mesh_id] is None):
-                continue
-
             face_vertices_camera_one_mesh, face_vertices_image_one_mesh, face_normals_one_mesh = \
                 kal.render.mesh.prepare_vertices(
                     mesh_vertices[mesh_id][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
@@ -350,7 +367,7 @@ class MVDiffusion(pl.LightningModule):
                     camera_projection,
                     camera_transform=camera_transform
                 ) # JA: shape of face_vertices_camera_one_mesh, face_vertices_image_one_mesh: (6, 30000, 3, 2)
-            
+
             face_attributes_one_mesh = kal.ops.mesh.index_vertices_by_faces(
                 mesh_uvs[mesh_id].repeat(num_viewpoints, 1, 1),
                 mesh_face_uvs_idx[mesh_id].long()
@@ -400,7 +417,7 @@ class MVDiffusion(pl.LightningModule):
         return seam_loss
 
         # return rgb_render
-    
+
     # JA: The purpose of the training step is to predict the x_0 from x_t and t.
     def training_step(self, batch, batch_idx):
         # get input
@@ -424,33 +441,32 @@ class MVDiffusion(pl.LightningModule):
         latents = self.encode_target_images(target_imgs)
         noise = torch.randn_like(latents)
         latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
-        
+
+        latents_noisy.requires_grad = True
+
         v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
-        # v_target = self.get_v(latents, noise, t)
+        v_target = self.get_v(latents, noise, t)
 
-        # reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
+        reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
+        # reconstruct_loss, reconstruct_loss_dict = checkpoint(
+        #     lambda v_pred, v_target: self.compute_loss(v_pred, v_target), v_pred, v_target
+        # )
 
-        # total_loss = reconstruct_loss
+        total_loss = reconstruct_loss
 
         # logging
-        # self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log("global_step", self.global_step, prog_bar=True, logger=True, on_step=True, on_epoch=False)
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
         # if self.global_step % 500 == 0 and self.global_rank == 0:
-        # # if self.use_seam_loss or (self.global_step % 500 == 0 and self.global_rank == 0):
         #     with torch.no_grad():
         #         latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
 
         #         latents_0 = unscale_latents(latents_pred_0)
         #         pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
         #         pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
-
-        #     # if self.use_seam_loss:
-        #     #     seam_loss = self.compute_seam_loss(pred_images_0, target_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
-
-        #     #     total_loss = seam_loss
 
         #     if self.global_step % 500 == 0 and self.global_rank == 0:
         #         images = torch.cat([target_imgs, pred_images_0], dim=-2)
@@ -464,7 +480,9 @@ class MVDiffusion(pl.LightningModule):
             with freeze_module(self.pipeline.vae):
                 self.pipeline.vae.eval()
 
-                decoded_image_0 = checkpoint( # JA: Apply checkpoint in function call of self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
+                # JA: Apply checkpoint in function call of:
+                # self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
+                decoded_image_0 = checkpoint(
                     lambda x: self.pipeline.vae.decode(x, return_dict=False)[0],
                     latents_0 / self.pipeline.vae.config.scaling_factor
                 )
@@ -479,8 +497,9 @@ class MVDiffusion(pl.LightningModule):
                 mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
             )
 
-            # total_loss += seam_loss
-            total_loss = seam_loss
+            if seam_loss is not None:
+                total_loss += seam_loss
+            # total_loss = seam_loss
 
         return total_loss # JA: PyTorch Lightning takes care of optimizing the loss
         

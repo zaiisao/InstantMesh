@@ -9,7 +9,7 @@ from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 from pathlib import Path
 import kaolin
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from src.utils.train_util import instantiate_from_config
 
@@ -30,8 +30,18 @@ def pad_tensors(tensor_list, pad_value=-1):
 
     return padded_tensors
 
-def collate_fn(data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
-    cond_imgs, target_imgs, target_depth_img, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = zip(*data)
+def collate_fn(data: List[Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    str
+]]):
+    cond_imgs, target_imgs, target_depth_img, \
+        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, image_path = zip(*data)
 
     data = {
         'cond_imgs': torch.stack(cond_imgs),
@@ -41,7 +51,9 @@ def collate_fn(data: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.
         'mesh_vertices': mesh_vertices,
         'mesh_faces': mesh_faces,
         'mesh_uvs': mesh_uvs,
-        'mesh_face_uvs_idx': mesh_face_uvs_idx
+        'mesh_face_uvs_idx': mesh_face_uvs_idx,
+
+        'image_path': image_path
     }
 
     return data
@@ -215,7 +227,11 @@ class ObjaverseData(Dataset):
 
         # JA: The modified dataset format includes the .glb file in each folder
         # mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
-        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(image_path)
+        try:
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(image_path)
+        except:
+            # JA: Some meshes do not include UVs. These should be skipped for the purposes of use seam loss
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = None, None, None, None
 
         # Commented by JA: Including the mesh vertices, faces, etc. here will not work because they have varying lengths.
         # This requires us to return the values themselves, so that they can be handled in the collate_fn with the usage
@@ -235,4 +251,6 @@ class ObjaverseData(Dataset):
         target_imgs = imgs[1:]
         target_depth_imgs = depths[1:]
 
-        return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
+        # print(image_path, cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
+
+        return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, image_path
