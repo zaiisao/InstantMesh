@@ -15,6 +15,9 @@ from src.utils.train_util import instantiate_from_config
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ["TORCH_USE_CUDA_DSA"] = '1'
 
+import torch
+torch.cuda.memory._record_memory_history()
+
 @rank_zero_only
 def rank_zero_print(*args):
     print(*args)

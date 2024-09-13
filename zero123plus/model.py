@@ -69,22 +69,6 @@ def split_zero123plus_grid(grid_image_3x2, tile_size):
 
     return image_stack
 
-@contextmanager
-def freeze_module(module):
-    # Store original requires_grad state
-    original_states = [param.requires_grad for param in module.parameters()]
-    
-    # Set requires_grad to False to freeze the module
-    for param in module.parameters():
-        param.requires_grad = False
-    
-    try:
-        yield  # This allows the code inside the context to run
-    finally:
-        # Restore the original requires_grad state
-        for param, state in zip(module.parameters(), original_states):
-            param.requires_grad = state
-
 class MVDiffusion(pl.LightningModule):
     def __init__(
         self,
@@ -104,15 +88,23 @@ class MVDiffusion(pl.LightningModule):
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
             pipeline.scheduler.config, timestep_spacing='trailing'
         )
+        
+        self.use_depth_controlnet = use_depth_controlnet
+        self.use_seam_loss = use_seam_loss
+
+        self.pipeline = pipeline
 
         if use_depth_controlnet:
             pipeline.add_controlnet(ControlNetModel.from_pretrained(
                 "sudo-ai/controlnet-zp11-depth-v1"
             ), conditioning_scale=0.75)
-        
-        self.use_seam_loss = use_seam_loss
 
-        self.pipeline = pipeline
+        if use_seam_loss:
+            for param in self.pipeline.vae.parameters():
+                param.requires_grad = False
+
+            # Set VAE to eval mode
+            self.pipeline.vae.eval()
 
         train_sched = DDPMScheduler.from_config(self.pipeline.scheduler.config)
         if isinstance(self.pipeline.unet, UNet2DConditionModel):
@@ -442,17 +434,10 @@ class MVDiffusion(pl.LightningModule):
         noise = torch.randn_like(latents)
         latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
 
-        latents_noisy.requires_grad = True
-
         v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
         v_target = self.get_v(latents, noise, t)
 
         reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
-        # reconstruct_loss, reconstruct_loss_dict = checkpoint(
-        #     lambda v_pred, v_target: self.compute_loss(v_pred, v_target), v_pred, v_target
-        # )
-
-        total_loss = reconstruct_loss
 
         # logging
         self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
@@ -477,17 +462,16 @@ class MVDiffusion(pl.LightningModule):
             latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
             latents_0 = unscale_latents(latents_pred_0)
 
-            with freeze_module(self.pipeline.vae):
-                self.pipeline.vae.eval()
+            # JA: Apply checkpoint in function call of:
+            # decoded_image_0 = self.pipeline.vae.decode(
+            #     latents_0 / self.pipeline.vae.config.scaling_factor,
+            #     return_dict=False
+            # )[0]
 
-                # JA: Apply checkpoint in function call of:
-                # self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0]
-                decoded_image_0 = checkpoint(
-                    lambda x: self.pipeline.vae.decode(x, return_dict=False)[0],
-                    latents_0 / self.pipeline.vae.config.scaling_factor
-                )
-
-                self.pipeline.vae.train()
+            decoded_image_0 = checkpoint(
+                lambda x: self.pipeline.vae.decode(x, return_dict=False)[0],
+                latents_0 / self.pipeline.vae.config.scaling_factor
+            )
 
             pred_images_0 = unscale_image(decoded_image_0)   # [-1, 1]
             pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
@@ -498,8 +482,12 @@ class MVDiffusion(pl.LightningModule):
             )
 
             if seam_loss is not None:
-                total_loss += seam_loss
-            # total_loss = seam_loss
+                total_loss = reconstruct_loss + seam_loss
+            else:
+                total_loss = None
+        else:
+            total_loss = reconstruct_loss
+
 
         return total_loss # JA: PyTorch Lightning takes care of optimizing the loss
         
@@ -508,7 +496,7 @@ class MVDiffusion(pl.LightningModule):
 
         prefix = 'train'
         loss_dict = {}
-        loss_dict.update({f'{prefix}/loss': loss})
+        loss_dict.update({f'{prefix}/loss': loss.item()})
 
         return loss, loss_dict
 
@@ -546,7 +534,11 @@ class MVDiffusion(pl.LightningModule):
     def configure_optimizers(self):
         lr = self.learning_rate
 
+        # if self.use_depth_controlnet:
+        #     optimizer = torch.optim.AdamW(self.unet.controlnet.parameters(), lr=lr)
+        # else:
         optimizer = torch.optim.AdamW(self.unet.parameters(), lr=lr)
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 3000, eta_min=lr/4)
 
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
