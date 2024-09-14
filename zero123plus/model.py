@@ -73,6 +73,7 @@ class MVDiffusion(pl.LightningModule):
     def __init__(
         self,
         stable_diffusion_config,
+        precision_half=False,
         drop_cond_prob=0.1,
         use_depth_controlnet=False,
         use_seam_loss=False,
@@ -80,11 +81,16 @@ class MVDiffusion(pl.LightningModule):
         super(MVDiffusion, self).__init__()
 
         self.drop_cond_prob = drop_cond_prob
+        self.precision_half = precision_half
 
         self.register_schedule()
 
         # init modules
-        pipeline = DiffusionPipeline.from_pretrained(**stable_diffusion_config)
+        pipeline = DiffusionPipeline.from_pretrained(
+            torch_dtype=torch.float16 if precision_half else torch.float32,
+            **stable_diffusion_config
+        )
+
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
             pipeline.scheduler.config, timestep_spacing='trailing'
         )
@@ -96,7 +102,8 @@ class MVDiffusion(pl.LightningModule):
 
         if use_depth_controlnet:
             pipeline.add_controlnet(ControlNetModel.from_pretrained(
-                "sudo-ai/controlnet-zp11-depth-v1"
+                "sudo-ai/controlnet-zp11-depth-v1",
+                torch_dtype=torch.float16 if precision_half else torch.float32,
             ), conditioning_scale=0.75)
 
         if use_seam_loss:
@@ -401,10 +408,13 @@ class MVDiffusion(pl.LightningModule):
             num_meshes, uv_features_mvhwc, pred_images_bchw_before_masking, object_masks_bchw
         )
 
-        target_images_bchw_before_masking = split_zero123plus_grid(target_images_grid, 320)
-        target_images_bchw = target_images_bchw_before_masking * object_masks_bchw
+        # target_images_bchw_before_masking = split_zero123plus_grid(target_images_grid, 320)
+        # target_images_bchw = target_images_bchw_before_masking * object_masks_bchw
+        pred_images_bchw = pred_images_bchw_before_masking * object_masks_bchw
 
-        seam_loss = ((target_images_bchw - image_features_bchw).pow(2)).mean()
+        # seam_loss = ((target_images_bchw - image_features_bchw).pow(2)).mean()
+        seam_loss = ((pred_images_bchw - image_features_bchw.detach()).pow(2)).mean()
+        seam_loss = seam_loss.to(torch.float16 if self.precision_half else torch.float32)
 
         return seam_loss
 
@@ -412,6 +422,10 @@ class MVDiffusion(pl.LightningModule):
 
     # JA: The purpose of the training step is to predict the x_0 from x_t and t.
     def training_step(self, batch, batch_idx):
+        # if self.global_step == 4:
+        #     torch.cuda.memory._dump_snapshot("seam_step_4.pickle")
+        #     torch.cuda.memory._record_memory_history(enabled=None)
+
         # get input
         cond_imgs, target_imgs, target_depth_imgs, \
         mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.prepare_batch_data(batch)
@@ -436,6 +450,7 @@ class MVDiffusion(pl.LightningModule):
 
         v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_latents, target_depth_imgs)
         v_target = self.get_v(latents, noise, t)
+        v_target = v_target.to(torch.float16 if self.precision_half else torch.float32)
 
         reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
 
@@ -460,24 +475,14 @@ class MVDiffusion(pl.LightningModule):
 
         if self.use_seam_loss:
             latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+            latents_pred_0 = latents_pred_0.to(torch.float16 if self.precision_half else torch.float32)
             latents_0 = unscale_latents(latents_pred_0)
 
-            # JA: Apply checkpoint in function call of:
-            # decoded_image_0 = self.pipeline.vae.decode(
-            #     latents_0 / self.pipeline.vae.config.scaling_factor,
-            #     return_dict=False
-            # )[0]
-
-            decoded_image_0 = checkpoint(
-                lambda x: self.pipeline.vae.decode(x, return_dict=False)[0],
-                latents_0 / self.pipeline.vae.config.scaling_factor
-            )
-
-            pred_images_0 = unscale_image(decoded_image_0)   # [-1, 1]
-            pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
+            scaled_pred_latents_0 = latents_0 / self.pipeline.vae.config.scaling_factor
+            scaled_target_latents = latents
 
             seam_loss = self.compute_seam_loss(
-                pred_images_0, target_imgs,
+                scaled_pred_latents_0, scaled_target_latents,
                 mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
             )
 
@@ -487,7 +492,6 @@ class MVDiffusion(pl.LightningModule):
                 total_loss = None
         else:
             total_loss = reconstruct_loss
-
 
         return total_loss # JA: PyTorch Lightning takes care of optimizing the loss
         
@@ -535,9 +539,9 @@ class MVDiffusion(pl.LightningModule):
         lr = self.learning_rate
 
         # if self.use_depth_controlnet:
-        #     optimizer = torch.optim.AdamW(self.unet.controlnet.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(self.unet.controlnet.parameters(), lr=lr)
         # else:
-        optimizer = torch.optim.AdamW(self.unet.parameters(), lr=lr)
+        # optimizer = torch.optim.AdamW(self.unet.parameters(), lr=lr)
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 3000, eta_min=lr/4)
 
