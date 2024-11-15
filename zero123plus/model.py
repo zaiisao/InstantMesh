@@ -421,9 +421,11 @@ class MVDiffusion(pl.LightningModule):
         seam_loss = ((pred_images_bchw - image_features_bchw.detach()).pow(2)).mean()
         seam_loss = seam_loss.to(torch.float16 if self.precision_half else torch.float32)
 
-        return seam_loss
+        prefix = 'train'
+        loss_dict = {}
+        loss_dict.update({f'{prefix}/s_loss': seam_loss.item()})
 
-        # return rgb_render
+        return seam_loss, loss_dict
 
     # JA: The purpose of the training step is to predict the x_0 from x_t and t.
     def training_step(self, batch, batch_idx):
@@ -458,11 +460,13 @@ class MVDiffusion(pl.LightningModule):
         v_target = self.get_v(latents, noise, t)
         v_target = v_target.to(torch.float16 if self.precision_half else torch.float32)
 
-        reconstruct_loss, reconstruct_loss_dict = self.compute_loss(v_pred, v_target)
+        reconstruct_loss, reconstruct_loss_dict = self.compute_reconstruct_loss(v_pred, v_target)
+        total_loss = reconstruct_loss
 
         # logging
-        self.log_dict(reconstruct_loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log("global_step", self.global_step, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        self.log_dict(reconstruct_loss_dict, batch_size=B, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        # self.log("global_step", self.global_step, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        self.logger.log_metrics({'global_step': self.global_step}, step=self.global_step)
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
@@ -481,38 +485,24 @@ class MVDiffusion(pl.LightningModule):
                 grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
                 save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
 
-            seam_loss = None
-
             if self.use_seam_loss:
-            #     latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
-            #     latents_pred_0 = latents_pred_0.to(torch.float16 if self.precision_half else torch.float32)
-            #     latents_0 = unscale_latents(latents_pred_0)
-
-                # scaled_pred_latents_0 = latents_0 / self.pipeline.vae.config.scaling_factor
-                # scaled_target_latents = latents
-
-                seam_loss = self.compute_seam_loss(
-                    # scaled_pred_latents_0, scaled_target_latents,
+                seam_loss, seam_loss_dict = self.compute_seam_loss(
                     pred_images_0, target_imgs,
                     mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx,
                     cond_azimuths
                 )
 
-            if seam_loss is not None:
-                total_loss = reconstruct_loss + seam_loss
-            else:
-                total_loss = None
-        else:
-            total_loss = reconstruct_loss
+                total_loss += seam_loss
+                self.log_dict(seam_loss_dict, batch_size=B, prog_bar=True, logger=True, on_step=True, on_epoch=True)
 
-        return total_loss # JA: PyTorch Lightning takes care of optimizing the loss
+        return total_loss
         
-    def compute_loss(self, noise_pred, noise_gt):
+    def compute_reconstruct_loss(self, noise_pred, noise_gt):
         loss = F.mse_loss(noise_pred, noise_gt)
 
         prefix = 'train'
         loss_dict = {}
-        loss_dict.update({f'{prefix}/loss': loss.item()})
+        loss_dict.update({f'{prefix}/r_loss': loss.item()})
 
         return loss, loss_dict
 

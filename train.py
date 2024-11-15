@@ -261,7 +261,10 @@ if __name__ == "__main__":
         instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
     
     trainer_kwargs['precision'] = '32-true'
-    trainer_kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)
+    
+    # JA: I changed find_unused_parameters to False because the trainer kept complaining that there are no unused
+    # parameters and that this affects performance
+    trainer_kwargs["strategy"] = DDPStrategy(find_unused_parameters=False) # DDPStrategy(find_unused_parameters=True)
 
     # trainer
     trainer = Trainer(**trainer_config, **trainer_kwargs, num_nodes=opt.num_nodes)
