@@ -3,7 +3,6 @@ model:
   target: zero123plus.model.MVDiffusion
   params:
     drop_cond_prob: 0.1
-    precision_half: true
 
     stable_diffusion_config:
       pretrained_model_name_or_path: sudo-ai/zero123plus-v1.1
