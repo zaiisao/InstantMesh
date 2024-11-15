@@ -181,9 +181,14 @@ class MVDiffusion(pl.LightningModule):
         mesh_uvs = list(batch['mesh_uvs'])
         mesh_face_uvs_idx = list(batch['mesh_face_uvs_idx'])
 
+        cond_azimuths = batch['cond_azimuths']
+
         # print(batch["image_path"])
 
-        return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
+        return \
+            cond_imgs, target_imgs, target_depth_imgs, \
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, \
+            cond_azimuths
     
     @torch.no_grad()
     def forward_vision_encoder(self, images):
@@ -312,7 +317,8 @@ class MVDiffusion(pl.LightningModule):
         mesh_vertices,
         mesh_faces,
         mesh_uvs,
-        mesh_face_uvs_idx
+        mesh_face_uvs_idx,
+        cond_azimuths
     ):
         # JA: Filter out problematic meshes where any component is None
         valid_indices = [i for i in range(len(mesh_vertices)) if 
@@ -335,29 +341,28 @@ class MVDiffusion(pl.LightningModule):
         num_meshes = len(mesh_vertices)
         assert len(mesh_vertices) == len(mesh_faces) == len(mesh_uvs) == len(mesh_face_uvs_idx)
 
-        # azimuths = [0, 30, 90, 150, 210, 270, 330]
-        # elevations = [0, 20, -10, 20, -10, 20, -10]
-        azimuths, elevations = get_zero123plus_angles()
-        azimuths = torch.from_numpy(azimuths).to(self.device, torch.float32)
-        elevations = torch.from_numpy(elevations).to(self.device, torch.float32)
+        # azimuths = [30, 90, 150, 210, 270, 330]
+        # elevations = [20, -10, 20, -10, 20, -10]
+        relative_azimuths, absolute_elevations = get_zero123plus_angles()
+        relative_azimuths = torch.from_numpy(relative_azimuths).to(self.device, torch.float32)
+        absolute_elevations = torch.from_numpy(absolute_elevations).to(self.device, torch.float32)
 
-        assert azimuths.shape[0] == elevations.shape[0]
-        num_viewpoints = azimuths.shape[0]
+        assert relative_azimuths.shape[0] == absolute_elevations.shape[0]
+        num_viewpoints = relative_azimuths.shape[0]
 
-        camera_transform = get_camera_from_views(
-            torch.deg2rad(90 - elevations),
-            torch.deg2rad(90 + azimuths),
-            r=1.5
-        ) # JA: shape = (6, 4, 3)
+        camera_dist1 = 0.5 / np.tan(np.radians(30 / 2))  #MJ: refer to https://github.com/SUDO-AI-3D/zero123plus/issues/73
+        camera_dist2 = (0.5 * (1 + np.tan(np.radians(30 / 2)))) / np.tan(np.radians(30 / 2))
 
-        sensor_width = 32
-        focal_length = 35
-        fovyangle = 2 * math.atan(sensor_width / (2 * focal_length))
+        r = camera_dist2
 
+        fovyangle = math.radians(30)
         camera_projection = kal.render.camera.generate_perspective_projection(fovyangle).to(self.device)
 
         uv_features_list, object_mask_list = [], []
         for mesh_id in range(num_meshes):
+            total_azimuths = (relative_azimuths + cond_azimuths[mesh_id]) % 360
+            camera_transform = get_camera_from_views(absolute_elevations, total_azimuths, r)
+
             face_vertices_camera_one_mesh, face_vertices_image_one_mesh, face_normals_one_mesh = \
                 kal.render.mesh.prepare_vertices(
                     mesh_vertices[mesh_id][None], # JA: (batch_size, num_vertices, 3); here, batch_size is 1 as we deal
@@ -428,7 +433,8 @@ class MVDiffusion(pl.LightningModule):
 
         # get input
         cond_imgs, target_imgs, target_depth_imgs, \
-        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.prepare_batch_data(batch)
+        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, \
+        cond_azimuths = self.prepare_batch_data(batch)
 
         # sample random timestep
         B = cond_imgs.shape[0]
@@ -460,31 +466,37 @@ class MVDiffusion(pl.LightningModule):
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-        # if self.global_step % 500 == 0 and self.global_rank == 0:
-        #     with torch.no_grad():
-        #         latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+        should_save_image = self.global_step % 500 == 0 and self.global_rank == 0
+        if should_save_image or self.use_seam_loss:
+            with torch.no_grad():
+                latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+                latents_pred_0 = latents_pred_0.to(torch.float16 if self.precision_half else torch.float32)
 
-        #         latents_0 = unscale_latents(latents_pred_0)
-        #         pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
-        #         pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
+                latents_0 = unscale_latents(latents_pred_0)
+                pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+                pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
 
-        #     if self.global_step % 500 == 0 and self.global_rank == 0:
-        #         images = torch.cat([target_imgs, pred_images_0], dim=-2)
-        #         grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
-        #         save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
+            if self.global_step % 500 == 0 and self.global_rank == 0:
+                images = torch.cat([target_imgs, pred_images_0], dim=-2)
+                grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
+                save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
 
-        if self.use_seam_loss:
-            latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
-            latents_pred_0 = latents_pred_0.to(torch.float16 if self.precision_half else torch.float32)
-            latents_0 = unscale_latents(latents_pred_0)
+            seam_loss = None
 
-            scaled_pred_latents_0 = latents_0 / self.pipeline.vae.config.scaling_factor
-            scaled_target_latents = latents
+            if self.use_seam_loss:
+            #     latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
+            #     latents_pred_0 = latents_pred_0.to(torch.float16 if self.precision_half else torch.float32)
+            #     latents_0 = unscale_latents(latents_pred_0)
 
-            seam_loss = self.compute_seam_loss(
-                scaled_pred_latents_0, scaled_target_latents,
-                mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
-            )
+                # scaled_pred_latents_0 = latents_0 / self.pipeline.vae.config.scaling_factor
+                # scaled_target_latents = latents
+
+                seam_loss = self.compute_seam_loss(
+                    # scaled_pred_latents_0, scaled_target_latents,
+                    pred_images_0, target_imgs,
+                    mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx,
+                    cond_azimuths
+                )
 
             if seam_loss is not None:
                 total_loss = reconstruct_loss + seam_loss

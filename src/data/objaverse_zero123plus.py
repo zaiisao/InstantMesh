@@ -11,6 +11,8 @@ from pathlib import Path
 import kaolin
 from typing import List, Tuple, Optional
 
+import struct
+
 from src.utils.train_util import instantiate_from_config
 
 def pad_tensors(tensor_list, pad_value=-1):
@@ -38,10 +40,11 @@ def collate_fn(data: List[Tuple[
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
-    str
+    str,
+    int
 ]]):
     cond_imgs, target_imgs, target_depth_img, \
-        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, image_path = zip(*data)
+        mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, image_path, cond_azimuths = zip(*data)
 
     data = {
         'cond_imgs': torch.stack(cond_imgs),
@@ -53,7 +56,9 @@ def collate_fn(data: List[Tuple[
         'mesh_uvs': mesh_uvs,
         'mesh_face_uvs_idx': mesh_face_uvs_idx,
 
-        'image_path': image_path
+        'image_path': image_path,
+
+        'cond_azimuths': cond_azimuths
     }
 
     return data
@@ -159,45 +164,16 @@ class ObjaverseData(Dataset):
         return image, alpha
     
     def load_mesh(self, image_path):
-        # mesh = kaolin.io.gltf.import_mesh(mesh_path)
-
-        # def normalize_mesh(vertices):
-        #     # Compute bounding box
-        #     bbox_min = torch.min(vertices, dim=0).values
-        #     bbox_max = torch.max(vertices, dim=0).values
-            
-        #     # Compute scale factor to fit within unit cube
-        #     scale = 1.0 / torch.max(bbox_max - bbox_min)
-            
-        #     # Scale vertices
-        #     scaled_vertices = vertices * scale
-            
-        #     # Recompute bounding box after scaling
-        #     bbox_min = torch.min(scaled_vertices, dim=0).values
-        #     bbox_max = torch.max(scaled_vertices, dim=0).values
-
-        #     # Compute translation to center mesh at origin
-        #     bbox_center = (bbox_min + bbox_max) / 2.0
-
-        #     # Translate vertices
-        #     vertices_from_bbox_center = scaled_vertices - bbox_center
-
-        #     # JA: scaled_vertices on the right-hand side refers to the coordiantes of the vertices from
-        #     # the world coordinate system
-
-        #     return vertices_from_bbox_center
-        
-        # mesh_vertices = normalize_mesh(mesh.vertices)
-        # mesh_faces = mesh.faces
-        # mesh_uvs = mesh.uvs
-        # mesh_face_uvs_idx = mesh.face_uvs_idx
-
         mesh_vertices = torch.load(os.path.join(image_path, 'mesh_vertices.pt'))
         mesh_faces = torch.load(os.path.join(image_path, 'mesh_faces.pt'))
         mesh_uvs = torch.load(os.path.join(image_path, 'mesh_uvs.pt'))
         mesh_face_uvs_idx = torch.load(os.path.join(image_path, 'mesh_face_uvs_idx.pt'))
 
-        return mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx
+        with open(os.path.join(image_path, 'azimuth.bin'), 'rb') as file:
+            binary_data = file.read(2)
+            cond_azimuth = struct.unpack('h', binary_data)[0]
+
+        return mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, cond_azimuth
 
     def __getitem__(self, index):
         while True:
@@ -228,10 +204,10 @@ class ObjaverseData(Dataset):
         # JA: The modified dataset format includes the .glb file in each folder
         # mesh_path = os.path.join(image_path, f'{self.paths[index]}.glb')
         try:
-            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = self.load_mesh(image_path)
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, cond_azimuth = self.load_mesh(image_path)
         except:
             # JA: Some meshes do not include UVs. These should be skipped for the purposes of use seam loss
-            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx = None, None, None, None
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, cond_azimuth = None, None, None, None, None
 
         # Commented by JA: Including the mesh vertices, faces, etc. here will not work because they have varying lengths.
         # This requires us to return the values themselves, so that they can be handled in the collate_fn with the usage
@@ -253,4 +229,8 @@ class ObjaverseData(Dataset):
 
         # print(image_path, cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx)
 
-        return cond_imgs, target_imgs, target_depth_imgs, mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, image_path
+        return \
+            cond_imgs, target_imgs, target_depth_imgs, \
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, \
+            image_path, \
+            cond_azimuth

@@ -3,21 +3,32 @@ import kaolin as kal
 from tqdm import tqdm
 from torch_scatter import scatter_max
 
-def get_camera_from_views(elev, azim, r):
-    # Adjust azimuth angle to account for coordinate system differences
-    azim = azim + torch.pi
+def get_camera_from_views(absolute_elevations, relative_azimuths, r):
+    # Convert elevation angle to polar angle
+    polars_angle_deg = 90 - absolute_elevations
+    polars_from_Y = torch.deg2rad(polars_angle_deg)
 
-    # Calculate camera position using Blender's logic adjusted for Kaolin
-    x = r * torch.sin(elev) * torch.sin(azim)
-    y = r * torch.cos(elev)
-    z = r * torch.sin(elev) * torch.cos(azim)
+    thetas_from_X_deg = relative_azimuths
+    thetas_from_Z_deg = thetas_from_X_deg + 90
+    thetas_from_Z = torch.deg2rad(thetas_from_Z_deg)
 
-    pos = torch.stack([x, y, z], dim=1)
-    look_at = torch.zeros_like(pos)
-    camera_up_direction = torch.ones_like(pos) * torch.tensor([0.0, 1.0, 0.0]).to(pos.device)
+    ys = r * torch.cos(polars_from_Y)
+    # Projection of r onto the world ZX plane (without considering azimuth angle) => project r onto the Z axis
+    zs = r * torch.sin(polars_from_Y) * torch.cos(thetas_from_Z)
+    xs = r * torch.sin(polars_from_Y) * torch.sin(thetas_from_Z)
 
-    camera_proj = kal.render.camera.generate_transformation_matrix(pos, look_at, camera_up_direction)
-    return camera_proj
+    # The vector (x_w,y_w,z_w) is the initial vector which will be rotated about the vertical axis Y_o of the object frame
+    # by the relative azimuth angle, theta_from_Z_o.
+
+    positions = torch.stack([xs, ys, zs], dim=1)
+    look_at = torch.zeros_like(positions)  #MJ: Look at the root of the world frame
+
+    # JA: As the camera's up direction is along the positive Y-axis in Kaolin, camera_up_direction is set to
+    # [0, 1, 0] to match this convention
+    camera_up_direction = torch.tensor([0.0, 1.0, 0.0], device=positions.device).unsqueeze(0).repeat(positions.size(0), 1)
+    camera_transforms = kal.render.camera.generate_transformation_matrix(positions, look_at, camera_up_direction)
+
+    return camera_transforms
 
 def normalize_multiple_depth(depth_maps):
     # assert (depth_maps.amax(dim=(1, 2)) <= 0).all(), 'depth map should be negative'
