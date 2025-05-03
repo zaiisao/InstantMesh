@@ -11,13 +11,19 @@ from torchvision.transforms import v2
 from torchvision.utils import make_grid, save_image
 from einops import rearrange
 from tqdm import tqdm
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel, ControlNetModel
 from .pipeline import RefOnlyNoisedUNet
 from .render import get_camera_from_views, create_face_view_map, compare_face_normals_between_views
 from src.utils.camera_util import get_zero123plus_angles
+import tracemalloc, linecache
 
+
+import psutil, os
+import gc, objgraph
+
+tracemalloc.start()
 def scale_latents(latents):
     latents = (latents - 0.22) * 0.75
     return latents
@@ -69,6 +75,47 @@ def split_zero123plus_grid(grid_image_3x2, tile_size):
 
     return image_stack
 
+def combine_zero123plus_grid(image_stack_6, tile_size=None):
+    """
+    Reverses `split_zero123plus_grid`.
+
+    Parameters
+    ----------
+    image_stack_6 : torch.Tensor
+        Output of `split_zero123plus_grid`, shape  ➜  (B*6, C, ts, ts).
+    tile_size : int, optional
+        If omitted we infer it from `image_stack_6.shape[-1]`.
+
+    Returns
+    -------
+    grid_image_3x2 : torch.Tensor
+        Re-assembled grid, shape  ➜  (B, C, 3*ts, 2*ts).
+    """
+    if image_stack_6.dim() == 3:            # (C, ts, ts) → treat as batch=1, tiles=1 … not invertible
+        raise ValueError("Need at least 6 tiles to reconstruct a 3×2 grid")
+
+    # --------- figure out the geometry
+    if tile_size is None:
+        tile_size = image_stack_6.shape[-1]
+
+    num_tiles, C, H, W = image_stack_6.shape
+    if H != tile_size or W != tile_size:
+        raise ValueError("tile_size does not match the tiles' spatial size")
+    if num_tiles % 6:
+        raise ValueError("Number of tiles must be a multiple of 6")
+
+    B = num_tiles // 6                        # original batch
+
+    # --------- put the tiles back where they came from
+    grid = (
+        image_stack_6
+            .view(B, 3, 2, C, tile_size, tile_size)   # (B, row, col, C, H, W)
+            .permute(0, 3, 1, 4, 2, 5)                # (B, C, row, H, col, W)
+            .contiguous()
+            .view(B, C, 3 * tile_size, 2 * tile_size) # merge row/col axes
+    )
+    return grid
+
 class MVDiffusion(pl.LightningModule):
     def __init__(
         self,
@@ -106,12 +153,18 @@ class MVDiffusion(pl.LightningModule):
                 torch_dtype=torch.float16 if precision_half else torch.float32,
             ), conditioning_scale=0.75)
 
+        self.refiner = None
+
         if use_seam_loss:
             for param in self.pipeline.vae.parameters():
                 param.requires_grad = False
 
+            for param in self.pipeline.unet.unet.parameters():
+                param.requires_grad = False
+
             # Set VAE to eval mode
             self.pipeline.vae.eval()
+            self.pipeline.unet.unet.eval()
 
         train_sched = DDPMScheduler.from_config(self.pipeline.scheduler.config)
         if isinstance(self.pipeline.unet, UNet2DConditionModel):
@@ -313,6 +366,7 @@ class MVDiffusion(pl.LightningModule):
     def compute_seam_loss(
         self,
         pred_images_grid,
+        pred_latents_grid,
         target_images_grid,
         mesh_vertices,
         mesh_faces,
@@ -332,6 +386,7 @@ class MVDiffusion(pl.LightningModule):
 
         # JA: Use the valid indices to create new filtered lists
         pred_images_grid = pred_images_grid[valid_indices]
+        pred_latents_grid = pred_latents_grid[valid_indices]
         target_images_grid = target_images_grid[valid_indices]
         mesh_vertices = [mesh_vertices[i] for i in valid_indices]
         mesh_faces = [mesh_faces[i] for i in valid_indices]
@@ -407,31 +462,51 @@ class MVDiffusion(pl.LightningModule):
         object_masks_bhwc = torch.cat(object_mask_list, dim=0)
         object_masks_bchw = object_masks_bhwc.permute(0, 3, 1, 2)
 
+        pred_latents_grid_upscaled = F.interpolate(pred_latents_grid, size=(960, 640), mode='nearest')
+
+        pred_latents_grid_upscaled_bchw_before_masking = split_zero123plus_grid(pred_latents_grid_upscaled, 320)
         pred_images_bchw_before_masking = split_zero123plus_grid(pred_images_grid, 320)
 
-        texture_maps, image_features_bchw = self.produce_texture_maps( # JA: Produce the texture atlas using the multiview images
+        texture_maps, interpolated_texture_bchw = self.produce_texture_maps( # JA: Produce the texture atlas using the multiview images
             num_meshes, uv_features_mvhwc, pred_images_bchw_before_masking, object_masks_bchw
         )
 
         # target_images_bchw_before_masking = split_zero123plus_grid(target_images_grid, 320)
         # target_images_bchw = target_images_bchw_before_masking * object_masks_bchw
         pred_images_bchw = pred_images_bchw_before_masking * object_masks_bchw
+        # pred_latents_upscaled_bchw = pred_latents_grid_upscaled_bchw_before_masking * object_masks_bchw
 
-        # seam_loss = ((target_images_bchw - image_features_bchw).pow(2)).mean()
-        seam_loss = ((pred_images_bchw - image_features_bchw.detach()).pow(2)).mean()
+        # pred_refiner_input = torch.cat([
+        #     pred_images_bchw_before_masking,
+        #     pred_latents_grid_upscaled_bchw_before_masking
+        # ], dim=1)
+        # pred_refiner_output_before_masking = self.refiner(pred_refiner_input)
+        # pred_refiner_output = pred_refiner_output_before_masking * object_masks_bchw
+
+        seam_loss = ((pred_images_bchw - interpolated_texture_bchw.detach()).pow(2)).mean()
+        # seam_loss = ((pred_refiner_output - interpolated_texture_bchw.detach()).pow(2)).mean()
         seam_loss = seam_loss.to(torch.float16 if self.precision_half else torch.float32)
 
         prefix = 'train'
         loss_dict = {}
         loss_dict.update({f'{prefix}/s_loss': seam_loss.item()})
 
-        return seam_loss, loss_dict
+        interpolated_texture_grid = combine_zero123plus_grid(interpolated_texture_bchw)
+
+        return seam_loss, loss_dict, interpolated_texture_grid
 
     # JA: The purpose of the training step is to predict the x_0 from x_t and t.
     def training_step(self, batch, batch_idx):
-        # if self.global_step == 4:
-        #     torch.cuda.memory._dump_snapshot("seam_step_4.pickle")
-        #     torch.cuda.memory._record_memory_history(enabled=None)
+
+        def log_ram_usage():
+            mem = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+            print(f"RAM usage: {mem:.2f} GB")
+        
+        # Call it every 100 steps
+        if self.global_step % 100 == 1:
+            log_ram_usage()
+            gc.collect()
+            objgraph.show_growth(limit=4)
 
         # get input
         cond_imgs, target_imgs, target_depth_imgs, \
@@ -472,28 +547,53 @@ class MVDiffusion(pl.LightningModule):
 
         should_save_image = self.global_step % 500 == 0 and self.global_rank == 0
         if should_save_image or self.use_seam_loss:
-            with torch.no_grad():
+            device_type = torch.device(self.device).type
+            context_managers = None
+
+            if self.use_seam_loss:
+                context_managers = ExitStack()
+                context_managers.enter_context(torch.backends.cudnn.flags(enabled=True, benchmark=False))
+                context_managers.enter_context(torch.amp.autocast(device_type, enabled=self.precision_half))
+            else:
+                context_managers = torch.no_grad()
+
+            with context_managers:
                 latents_pred_0 = self.predict_start_from_z_and_v(latents_noisy, t, v_pred)
                 latents_pred_0 = latents_pred_0.to(torch.float16 if self.precision_half else torch.float32)
 
-                latents_0 = unscale_latents(latents_pred_0)
-                pred_images_0 = unscale_image(self.pipeline.vae.decode(latents_0 / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+                pred_latents_0 = unscale_latents(latents_pred_0)
+
+                def wrapped_decode(*args):
+                    return self.pipeline.vae.decode(
+                        pred_latents_0 / self.pipeline.vae.config.scaling_factor,
+                        return_dict=True
+                    )
+
+                pred_images_0 = unscale_image(checkpoint(wrapped_decode)[0])   # [-1, 1]
                 pred_images_0 = (pred_images_0 * 0.5 + 0.5).clamp(0, 1)
 
-            if self.global_step % 500 == 0 and self.global_rank == 0:
-                images = torch.cat([target_imgs, pred_images_0], dim=-2)
-                grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
-                save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
-
+            interpolated_texture_grid = None
             if self.use_seam_loss:
-                seam_loss, seam_loss_dict = self.compute_seam_loss(
-                    pred_images_0, target_imgs,
+                seam_loss, seam_loss_dict, interpolated_texture_grid = self.compute_seam_loss(
+                    pred_images_0, pred_latents_0, target_imgs,
                     mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx,
                     cond_azimuths
                 )
 
                 total_loss += seam_loss
                 self.log_dict(seam_loss_dict, batch_size=B, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+
+            if self.global_step % 500 == 0 and self.global_rank == 0:
+                if self.use_seam_loss:
+                    images = torch.cat([target_imgs, pred_images_0, interpolated_texture_grid], dim=-2)
+                else:
+                    images = torch.cat([target_imgs, pred_images_0], dim=-2)
+
+                grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
+                save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         return total_loss
         
@@ -509,13 +609,22 @@ class MVDiffusion(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         # get input
-        cond_imgs, target_imgs = self.prepare_batch_data(batch)
+        # cond_imgs, target_imgs = self.prepare_batch_data(batch)
+        cond_imgs, target_imgs, target_depth_imgs, \
+            mesh_vertices, mesh_faces, mesh_uvs, mesh_face_uvs_idx, \
+            cond_azimuths = self.prepare_batch_data(batch)
 
-        images_pil = [v2.functional.to_pil_image(cond_imgs[i]) for i in range(cond_imgs.shape[0])]
+        cond_images_pil = [v2.functional.to_pil_image(cond_imgs[i]) for i in range(cond_imgs.shape[0])]
+        target_depth_images_pil = [v2.functional.to_pil_image(target_depth_imgs[i]) for i in range(target_depth_imgs.shape[0])]
 
         outputs = []
-        for cond_img in images_pil:
-            latent = self.pipeline(cond_img, num_inference_steps=75, output_type='latent').images
+        for cond_img, target_depth_img in zip(cond_images_pil, target_depth_images_pil):
+            latent = self.pipeline(
+                cond_img,
+                num_inference_steps=75,
+                output_type='latent',
+                depth_image=target_depth_img
+            ).images
             image = unscale_image(self.pipeline.vae.decode(latent / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
             image = (image * 0.5 + 0.5).clamp(0, 1)
             outputs.append(image)
@@ -540,10 +649,13 @@ class MVDiffusion(pl.LightningModule):
     def configure_optimizers(self):
         lr = self.learning_rate
 
-        # if self.use_depth_controlnet:
-        optimizer = torch.optim.AdamW(self.unet.controlnet.parameters(), lr=lr)
-        # else:
-        # optimizer = torch.optim.AdamW(self.unet.parameters(), lr=lr)
+        if self.use_depth_controlnet:
+            optimizer = torch.optim.AdamW(
+                list(self.unet.controlnet.parameters()),
+                lr=lr
+            )
+        else:
+            optimizer = torch.optim.AdamW(self.unet.parameters(), lr=lr)
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 3000, eta_min=lr/4)
 

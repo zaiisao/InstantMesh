@@ -3,6 +3,7 @@ import argparse
 import shutil
 import subprocess
 from omegaconf import OmegaConf
+import datetime
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -164,6 +165,7 @@ if __name__ == "__main__":
     cfg_name = os.path.splitext(cfg_fname)[0]
     exp_name = "-" + opt.name if opt.name != "" else ""
     logdir = os.path.join(opt.logdir, cfg_name+exp_name)
+    nowname = os.path.basename(logdir)
 
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
@@ -194,15 +196,34 @@ if __name__ == "__main__":
     trainer_kwargs = dict()
 
     # logger
-    default_logger_cfg = {
-        "target": "pytorch_lightning.loggers.TensorBoardLogger",
-        "params": {
-            "name": "tensorboard",
-            "save_dir": logdir, 
-            "version": "0",
-        }
+    default_logger_cfgs = {
+        "wandb": {
+            "target": "pytorch_lightning.loggers.WandbLogger",
+            "params": {
+                "name":    nowname,          # run name
+                "project": "seam_loss",      # W&B project
+                "save_dir": logdir,
+                # "offline": opt.debug,        # use offline mode when --debug is set
+                "id":      nowname           # ensures resuming picks the same run
+            }
+        },
+        "tensorboard": {                     # fallback if you prefer TB
+            "target": "pytorch_lightning.loggers.TensorBoardLogger",
+            "params": {
+                "name":    "tensorboard",
+                "save_dir": logdir,
+                "version": "0"
+            }
+        },
     }
-    logger_cfg = OmegaConf.merge(default_logger_cfg)
+
+    # choose your default here
+    default_logger_cfg = default_logger_cfgs["wandb"]
+
+    # allow YAML-level override
+    logger_cfg = lightning_config.get("logger", OmegaConf.create())
+    logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
+
     trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
 
     # model checkpoint

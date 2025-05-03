@@ -10,6 +10,7 @@ from PIL import Image
 from pathlib import Path
 import kaolin
 from typing import List, Tuple, Optional
+import math
 
 import struct
 
@@ -95,6 +96,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
     def train_dataloader(self):
         sampler = DistributedSampler(self.datasets['train'])
+        steps_per_epoch = math.ceil(len(self.datasets['train']) / self.batch_size)
+
         return wds.WebLoader(
             self.datasets['train'],
             batch_size=self.batch_size,
@@ -102,7 +105,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             shuffle=False,
             sampler=sampler,
             collate_fn=collate_fn
-        )
+        ).with_length(steps_per_epoch)
 
     def val_dataloader(self):
         sampler = DistributedSampler(self.datasets['validation'])
@@ -142,11 +145,11 @@ class ObjaverseData(Dataset):
             paths.extend(lvis_dict[k])
         self.paths = paths
             
-        # total_objects = len(self.paths)
-        # if validation:
-        #     self.paths = self.paths[-16:] # used last 16 as validation
-        # else:
-        #     self.paths = self.paths[:-16]
+        total_objects = len(self.paths)
+        if validation:
+            self.paths = self.paths[-16:] # used last 16 as validation
+        else:
+            self.paths = self.paths[:-16]
         print('============= length of dataset %d =============' % len(self.paths))
 
     def __len__(self):
